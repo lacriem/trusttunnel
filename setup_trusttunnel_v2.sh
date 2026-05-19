@@ -250,6 +250,15 @@ EOF
     fi
 
     cat > rules.toml << 'EOF'
+# ВНИМАНИЕ: правила фильтрации оцениваются по порядку.
+# Если ни одно правило не совпало — соединение РАЗРЕШАЕТСЯ (default-allow).
+# Настоятельно рекомендуется добавить разрешающие правила для ваших клиентов
+# и завершить файл catch-all deny:
+#
+#   [[rule]]
+#   action = "deny"
+#
+# Документация: https://github.com/TrustTunnel/TrustTunnel/blob/master/CONFIGURATION.md#rules-reference
 EOF
 
     cat > vpn.toml << EOF
@@ -261,20 +270,20 @@ allow_private_network_connections = false
 tls_handshake_timeout_secs = 10
 client_listener_timeout_secs = 600
 connection_establishment_timeout_secs = 30
-tcp_connections_timeout_secs = 604800
+tcp_connections_timeout_secs = 86400
 udp_connections_timeout_secs = 300
 speedtest_enable = false
 
 [listen_protocols]
 
 [listen_protocols.http1]
-upload_buffer_size = 32768
+upload_buffer_size = 65536
 
 [listen_protocols.http2]
 initial_connection_window_size = 8388608
 initial_stream_window_size = 131072
 max_concurrent_streams = 1000
-max_frame_size = 16384
+max_frame_size = 65536
 header_table_size = 65536
 
 [listen_protocols.quic]
@@ -289,7 +298,7 @@ initial_max_streams_uni = 4096
 max_connection_window = 25165824
 max_stream_window = 16777216
 disable_active_migration = true
-enable_early_data = true
+enable_early_data = false
 message_queue_capacity = 4096
 EOF
 
@@ -302,7 +311,6 @@ reverse_proxy_hosts = []
 hostname = "$DOMAIN"
 cert_chain_path = "/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
 private_key_path = "/etc/letsencrypt/live/$DOMAIN/privkey.pem"
-allowed_sni = ["time.android.com"]
 EOF
 
     log_info "Конфигурация создана"
