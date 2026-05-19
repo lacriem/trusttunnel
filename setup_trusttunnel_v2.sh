@@ -72,6 +72,53 @@ install_deps() {
 # ===========================
 # 2. INSTALL TRUSTTUNNEL
 # ===========================
+verify_gpg_signature() {
+    local tt_gpg_key="28645AC9776EC4C00BCE2AFC0FE641E7235E2EC6"
+    local tt_gpg_keyserver="keys.openpgp.org"
+
+    if ! command -v gpg &>/dev/null; then
+        log_warn "GPG не установлен — пропускаем проверку подписи бинарника"
+        log_warn "Установите gnupg: apt-get install -y gnupg"
+        return
+    fi
+
+    log_info "Импортируем GPG-ключ AdGuard для верификации бинарника..."
+    gpg --keyserver "$tt_gpg_keyserver" --recv-key "$tt_gpg_key" 2>/dev/null || {
+        log_warn "Не удалось импортировать GPG-ключ AdGuard с $tt_gpg_keyserver"
+        log_warn "Попробуйте вручную: gpg --keyserver '$tt_gpg_keyserver' --recv-key '$tt_gpg_key'"
+        return
+    }
+
+    local verified=0
+    local binary_path="${TT_DIR}/trusttunnel_endpoint"
+
+    # Ищем .sig файлы — могут лежать рядом с бинарником или в подпапке
+    for sig_candidate in \
+        "${TT_DIR}/trusttunnel_endpoint.sig" \
+        "${TT_DIR}/trusttunnel/trusttunnel_endpoint.sig" \
+        "${TT_DIR}"/*.sig; do
+        if [ -f "$sig_candidate" ]; then
+            log_info "Найден .sig-файл: $sig_candidate"
+            if gpg --verify "$sig_candidate" "$binary_path" 2>&1 | grep -q "Good signature"; then
+                log_info "GPG-подпись бинарника ВАЛИДНА (AdGuard)"
+                verified=1
+                break
+            else
+                log_error "GPG-подпись НЕДЕЙСТВИТЕЛЬНА для $sig_candidate!"
+                log_error "Бинарник мог быть подменён. НЕ ИСПОЛЬЗУЙТЕ его."
+                log_error "Проверьте вручную: gpg --verify $sig_candidate $binary_path"
+                verified=-1
+            fi
+        fi
+    done
+
+    if [ "$verified" -eq 0 ]; then
+        log_warn ".sig-файл не найден — GPG-верификация пропущена"
+        log_warn "Возможно, установлена версия <0.9.126 (без подписи) или .sig лежит в другом месте."
+        log_warn "Документация: https://github.com/TrustTunnel/TrustTunnel/blob/master/VERIFY_RELEASES.md"
+    fi
+}
+
 install_trusttunnel() {
     if [ -f "${TT_DIR}/trusttunnel_endpoint" ]; then
         log_warn "TrustTunnel уже установлен в ${TT_DIR}"
@@ -126,6 +173,9 @@ install_trusttunnel() {
         exit 1
     fi
     log_info "TrustTunnel установлен"
+
+    # GPG-верификация бинарника (c v0.9.126 релизы подписаны AdGuard)
+    verify_gpg_signature
 }
 
 # ===========================
@@ -270,7 +320,7 @@ allow_private_network_connections = false
 tls_handshake_timeout_secs = 10
 client_listener_timeout_secs = 600
 connection_establishment_timeout_secs = 30
-tcp_connections_timeout_secs = 86400
+tcp_connections_timeout_secs = 7200
 udp_connections_timeout_secs = 300
 speedtest_enable = false
 
@@ -723,17 +773,142 @@ EOF
 }
 
 # ===========================
-# MAIN
+# 12. FULL UNINSTALL
 # ===========================
-main() {
-    check_root
-    check_tty
+uninstall_trusttunnel() {
+    echo ""
+    echo "=========================================="
+    echo "  ПОЛНОЕ УДАЛЕНИЕ TRUSTTUNNEL"
+    echo "=========================================="
+    echo ""
+
+    read -rp "Вы уверены, что хотите ПОЛНОСТЬЮ удалить TrustTunnel? [y/N]: " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        log_info "Удаление отменено"
+        return
+    fi
+
+    log_info "Останавливаем и удаляем systemd-сервисы..."
+    systemctl stop trusttunnel 2>/dev/null || true
+    systemctl stop trusttunnel-update.timer 2>/dev/null || true
+    systemctl disable trusttunnel 2>/dev/null || true
+    systemctl disable trusttunnel-update.timer 2>/dev/null || true
+    systemctl disable trusttunnel-update.service 2>/dev/null || true
+    rm -f /etc/systemd/system/trusttunnel.service
+    rm -f /etc/systemd/system/trusttunnel-update.service
+    rm -f /etc/systemd/system/trusttunnel-update.timer
+    systemctl daemon-reload
+
+    log_info "Удаляем cron-задания..."
+    rm -f /etc/cron.d/trusttunnel-cert-renewal
+    rm -f /etc/cron.d/trusttunnel-auto-update
+
+    log_info "Удаляем lock-файлы..."
+    rm -f /var/lock/trusttunnel-update.lock
+
+    log_info "Удаляем логи..."
+    rm -f /var/log/trusttunnel-update.log
+    rm -f /var/log/trusttunnel-cert-renewal.log
+
+    # Чистим journald от логов TrustTunnel (требует прав)
+    if command -v journalctl &>/dev/null; then
+        journalctl --vacuum-time=1s --unit=trusttunnel 2>/dev/null || true
+        journalctl --vacuum-time=1s --unit=trusttunnel-update 2>/dev/null || true
+    fi
+
+    log_info "Удаляем рабочую директорию /opt/trusttunnel..."
+    rm -rf /opt/trusttunnel
+
+    log_info "Удаляем клиентские конфигурации из /root/..."
+    rm -f /root/trusttunnel_clients.txt
+    rm -f /root/*_trusttunnel.toml
+
+    # Сертификаты Let's Encrypt
+    if [ -d /etc/letsencrypt/live ] && [ -n "$(ls -A /etc/letsencrypt/live 2>/dev/null)" ]; then
+        echo ""
+        read -rp "Удалить сертификаты Let's Encrypt? [y/N]: " del_certs
+        if [[ "$del_certs" =~ ^[Yy]$ ]]; then
+            log_info "Удаляем сертификаты Let's Encrypt..."
+            certbot delete --non-interactive 2>/dev/null || {
+                # Ручное удаление если certbot delete не сработал
+                rm -rf /etc/letsencrypt/live/*
+                rm -rf /etc/letsencrypt/archive/*
+                rm -rf /etc/letsencrypt/renewal/*
+            }
+        fi
+    fi
+
+    # Правила файрвола
+    echo ""
+    read -rp "Удалить правила файрвола TrustTunnel? [y/N]: " del_fw
+    if [[ "$del_fw" =~ ^[Yy]$ ]]; then
+        if command -v ufw &>/dev/null && ufw status | grep -q 'TrustTunnel'; then
+            log_info "Удаляем правила UFW для TrustTunnel..."
+            # Удаляем по номерам правил с конца
+            ufw status numbered | grep -i 'TrustTunnel\|trusttunnel' | awk -F'[][]' '{print $2}' | sort -rn | while read -r num; do
+                ufw --force delete "$num" 2>/dev/null || true
+            done
+        fi
+        log_info "Очистка iptables (только правила TrustTunnel не трогаем,"
+        log_info "  полный сброс делается вручную: iptables -F && netfilter-persistent save)"
+        rm -f /etc/iptables/rules.v4
+    fi
+
+    # Чистим кэш apt
+    log_info "Очищаем кэш apt..."
+    apt-get clean -qq 2>/dev/null || true
+    apt-get autoclean -qq 2>/dev/null || true
+
+    # Удаляем GPG-ключ AdGuard из связки root
+    if command -v gpg &>/dev/null; then
+        gpg --batch --yes --delete-key "28645AC9776EC4C00BCE2AFC0FE641E7235E2EC6" 2>/dev/null || true
+    fi
+
+    echo ""
+    log_info "========================================"
+    log_info "  TRUSTTUNNEL ПОЛНОСТЬЮ УДАЛЁН"
+    log_info "========================================"
+    echo ""
+    echo "Удалено:"
+    echo "  - systemd-сервисы и таймеры"
+    echo "  - cron-задания"
+    echo "  - /opt/trusttunnel/ (бинарник, конфиги, бэкапы, автообновление)"
+    echo "  - /root/*_trusttunnel.toml (клиентские конфиги)"
+    echo "  - Логи (/var/log/trusttunnel-*)"
+    echo "  - Кэш apt"
+    echo ""
+}
+
+# ===========================
+# 13. MENU SYSTEM
+# ===========================
+
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+
+show_header() {
+    clear 2>/dev/null || true
+    echo ""
+    echo -e "${GREEN}╔══════════════════════════════════════════════╗${NC}"
+    echo -e "${GREEN}║        TRUSTTUNNEL VPN MANAGER v2            ║${NC}"
+    echo -e "${GREEN}╚══════════════════════════════════════════════╝${NC}"
+    echo ""
+}
+
+press_enter() {
+    echo ""
+    read -rp "Нажмите Enter для продолжения..." _
+}
+
+full_install() {
+    show_header
+    echo "=== ПОЛНАЯ УСТАНОВКА TRUSTTUNNEL ==="
+    echo ""
     install_deps
     install_trusttunnel
     get_user_input
-
     check_port_available "$LISTEN_PORT"
-
     generate_configs
     get_certificate
     setup_auto_renewal
@@ -743,28 +918,809 @@ main() {
     setup_firewall
 
     echo ""
-    echo "========================================"
-    echo "  УСТАНОВКА ЗАВЕРШЕНА УСПЕШНО!"
-    echo "========================================"
+    echo -e "${GREEN}========================================${NC}"
+    echo -e "${GREEN}    УСТАНОВКА ЗАВЕРШЕНА УСПЕШНО!${NC}"
+    echo -e "${GREEN}========================================${NC}"
     echo ""
-    echo "Домен:        $DOMAIN"
-    echo "Порт:         $LISTEN_PORT"
-    echo "Пользователей: ${#USERNAMES[@]}"
+    echo -e "Домен:        ${BOLD}$DOMAIN${NC}"
+    echo -e "Порт:         ${BOLD}$LISTEN_PORT${NC}"
+    echo -e "Пользователей: ${BOLD}${#USERNAMES[@]}${NC}"
     for idx in "${!USERNAMES[@]}"; do
         echo "  - ${USERNAMES[$idx]} (конфиг: /root/${CLIENT_NAMES[$idx]}_trusttunnel.toml)"
     done
     echo ""
-    echo "Сертификат:   Let's Encrypt (автообновление настроено)"
-    echo "Автообновление TrustTunnel: systemd timer + cron"
+    echo "Сертификат:   Let's Encrypt (автообновление)"
     echo "Сервис:       systemctl status trusttunnel"
     echo "Логи:         journalctl -u trusttunnel -f"
-    echo "Обновления:   journalctl -u trusttunnel-update -f"
     echo "Клиент инфо:  /root/trusttunnel_clients.txt"
     echo ""
-    echo "Для подключения:"
-    echo "  1. Скачайте .toml файлы с сервера (/root/*_trusttunnel.toml)"
-    echo "  2. Используйте TrustTunnel CLI клиент или мобильное приложение"
+    press_enter
+}
+
+# -------- PRESETS --------
+
+apply_preset() {
+    local config="${TT_DIR}/vpn.toml"
+    if [ ! -f "$config" ]; then
+        log_error "vpn.toml не найден. Сначала установите TrustTunnel."
+        press_enter
+        return
+    fi
+
+    show_header
+    echo "=== ПРЕСЕТЫ КОНФИГУРАЦИИ ==="
     echo ""
+    echo "  ${BOLD}1) mobile${NC}      — низкие таймауты, оптимизация для 4G/5G"
+    echo "  ${BOLD}2) performance${NC} — большие буферы, для гигабитных каналов"
+    echo "  ${BOLD}3) stealth${NC}     — консервативные настройки, обход DPI"
+    echo "  ${BOLD}4) balanced${NC}    — сбалансированные значения (рекомендуется)"
+    echo ""
+    read -rp "Выберите пресет [1-4]: " preset
+
+    local ts=$(date +%Y%m%d%H%M%S)
+    cp "$config" "${BACKUP_DIR}/vpn.toml.before_preset.${ts}" 2>/dev/null || true
+
+    case "$preset" in
+        1)
+            log_info "Применяем пресет: mobile"
+            sed -i 's/^tcp_connections_timeout_secs = .*/tcp_connections_timeout_secs = 3600/' "$config"
+            sed -i 's/^udp_connections_timeout_secs = .*/udp_connections_timeout_secs = 180/' "$config"
+            sed -i 's/^client_listener_timeout_secs = .*/client_listener_timeout_secs = 300/' "$config"
+            sed -i 's/^max_concurrent_streams = .*/max_concurrent_streams = 256/' "$config"
+            sed -i 's/^initial_max_data = .*/initial_max_data = 52428800/' "$config"
+            sed -i 's/^message_queue_capacity = .*/message_queue_capacity = 2048/' "$config"
+            ;;
+        2)
+            log_info "Применяем пресет: performance"
+            sed -i 's/^max_concurrent_streams = .*/max_concurrent_streams = 2000/' "$config"
+            sed -i 's/^initial_connection_window_size = .*/initial_connection_window_size = 16777216/' "$config"
+            sed -i 's/^initial_stream_window_size = .*/initial_stream_window_size = 524288/' "$config"
+            sed -i 's/^upload_buffer_size = .*/upload_buffer_size = 131072/' "$config"
+            sed -i 's/^initial_max_streams_bidi = .*/initial_max_streams_bidi = 8192/' "$config"
+            sed -i 's/^initial_max_streams_uni = .*/initial_max_streams_uni = 8192/' "$config"
+            sed -i 's/^message_queue_capacity = .*/message_queue_capacity = 8192/' "$config"
+            ;;
+        3)
+            log_info "Применяем пресет: stealth"
+            sed -i 's/^max_frame_size = .*/max_frame_size = 16384/' "$config"
+            sed -i 's/^max_concurrent_streams = .*/max_concurrent_streams = 100/' "$config"
+            sed -i 's/^initial_max_streams_bidi = .*/initial_max_streams_bidi = 128/' "$config"
+            sed -i 's/^initial_max_streams_uni = .*/initial_max_streams_uni = 128/' "$config"
+            sed -i 's/^enable_early_data = .*/enable_early_data = false/' "$config"
+            sed -i 's/^send_udp_payload_size = .*/send_udp_payload_size = 1200/' "$config"
+            sed -i 's/^recv_udp_payload_size = .*/recv_udp_payload_size = 1200/' "$config"
+            ;;
+        4)
+            log_info "Применяем пресет: balanced (значения по умолчанию)"
+            sed -i 's/^tcp_connections_timeout_secs = .*/tcp_connections_timeout_secs = 7200/' "$config"
+            sed -i 's/^udp_connections_timeout_secs = .*/udp_connections_timeout_secs = 300/' "$config"
+            sed -i 's/^client_listener_timeout_secs = .*/client_listener_timeout_secs = 600/' "$config"
+            sed -i 's/^max_concurrent_streams = .*/max_concurrent_streams = 1000/' "$config"
+            sed -i 's/^initial_connection_window_size = .*/initial_connection_window_size = 8388608/' "$config"
+            sed -i 's/^initial_stream_window_size = .*/initial_stream_window_size = 131072/' "$config"
+            sed -i 's/^upload_buffer_size = .*/upload_buffer_size = 65536/' "$config"
+            sed -i 's/^max_frame_size = .*/max_frame_size = 65536/' "$config"
+            sed -i 's/^initial_max_data = .*/initial_max_data = 104857600/' "$config"
+            sed -i 's/^initial_max_streams_bidi = .*/initial_max_streams_bidi = 4096/' "$config"
+            sed -i 's/^initial_max_streams_uni = .*/initial_max_streams_uni = 4096/' "$config"
+            sed -i 's/^message_queue_capacity = .*/message_queue_capacity = 4096/' "$config"
+            sed -i 's/^enable_early_data = .*/enable_early_data = false/' "$config"
+            sed -i 's/^send_udp_payload_size = .*/send_udp_payload_size = 1350/' "$config"
+            sed -i 's/^recv_udp_payload_size = .*/recv_udp_payload_size = 1350/' "$config"
+            ;;
+        *)
+            log_error "Неверный выбор"
+            press_enter
+            return
+            ;;
+    esac
+
+    log_info "Бэкап сохранён: ${BACKUP_DIR}/vpn.toml.before_preset.${ts}"
+
+    if systemctl is-active --quiet trusttunnel 2>/dev/null; then
+        read -rp "Перезапустить TrustTunnel для применения? [Y/n]: " restart
+        if [[ ! "$restart" =~ ^[Nn]$ ]]; then
+            systemctl restart trusttunnel
+            log_info "Сервис перезапущен"
+        fi
+    fi
+    press_enter
+}
+
+# -------- RECONFIGURE --------
+
+reconfigure_menu() {
+    while true; do
+        show_header
+        echo "=== НАСТРОЙКА КОНФИГУРАЦИИ ==="
+        echo ""
+        echo "  1) Применить пресет (mobile / performance / stealth / balanced)"
+        echo "  2) Редактировать rules.toml (фильтрация подключений)"
+        echo "  3) Редактировать vpn.toml вручную"
+        echo "  4) Перезагрузить TLS-хосты (SIGHUP)"
+        echo "  5) Просмотр текущей конфигурации"
+        echo ""
+        echo "  0) Назад"
+        echo ""
+        read -rp "Выберите пункт [0-5]: " choice
+
+        case "$choice" in
+            1) apply_preset ;;
+            2)
+                if [ -f "${TT_DIR}/rules.toml" ]; then
+                    nano "${TT_DIR}/rules.toml"
+                    if systemctl is-active --quiet trusttunnel 2>/dev/null; then
+                        read -rp "Перезапустить TrustTunnel? [y/N]: " restart
+                        [[ "$restart" =~ ^[Yy]$ ]] && systemctl restart trusttunnel
+                    fi
+                else
+                    log_error "rules.toml не найден. Сначала установите TrustTunnel."
+                    press_enter
+                fi
+                ;;
+            3)
+                if [ -f "${TT_DIR}/vpn.toml" ]; then
+                    cp "${TT_DIR}/vpn.toml" "${BACKUP_DIR}/vpn.toml.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+                    nano "${TT_DIR}/vpn.toml"
+                    if systemctl is-active --quiet trusttunnel 2>/dev/null; then
+                        read -rp "Перезапустить TrustTunnel? [y/N]: " restart
+                        [[ "$restart" =~ ^[Yy]$ ]] && systemctl restart trusttunnel
+                    fi
+                else
+                    log_error "vpn.toml не найден. Сначала установите TrustTunnel."
+                    press_enter
+                fi
+                ;;
+            4)
+                if systemctl is-active --quiet trusttunnel 2>/dev/null; then
+                    systemctl reload trusttunnel 2>/dev/null || kill -HUP "$(pidof trusttunnel_endpoint 2>/dev/null || echo 0)" 2>/dev/null || log_warn "Не удалось отправить SIGHUP"
+                    log_info "TLS-хосты перезагружены"
+                else
+                    log_error "TrustTunnel не запущен"
+                fi
+                press_enter
+                ;;
+            5)
+                show_header
+                echo "=== ТЕКУЩАЯ КОНФИГУРАЦИЯ ==="
+                echo ""
+                if [ -f "${TT_DIR}/vpn.toml" ]; then
+                    echo -e "${CYAN}--- vpn.toml ---${NC}"
+                    cat "${TT_DIR}/vpn.toml"
+                fi
+                if [ -f "${TT_DIR}/hosts.toml" ]; then
+                    echo ""
+                    echo -e "${CYAN}--- hosts.toml ---${NC}"
+                    cat "${TT_DIR}/hosts.toml"
+                fi
+                if [ -f "${TT_DIR}/rules.toml" ] && [ -s "${TT_DIR}/rules.toml" ]; then
+                    echo ""
+                    echo -e "${CYAN}--- rules.toml ---${NC}"
+                    cat "${TT_DIR}/rules.toml"
+                fi
+                press_enter
+                ;;
+            0) return ;;
+            *) log_warn "Неверный выбор" && sleep 1 ;;
+        esac
+    done
+}
+
+# -------- USER MANAGEMENT --------
+
+list_users() {
+    local cred_file="${TT_DIR}/credentials.toml"
+    if [ ! -f "$cred_file" ]; then
+        echo "  (нет пользователей — credentials.toml не найден)"
+        return
+    fi
+    local count=0
+    while IFS= read -r line; do
+        if [[ "$line" =~ username[[:space:]]*=[[:space:]]*\"(.+)\" ]]; then
+            count=$((count + 1))
+            echo "  $count) ${BASH_REMATCH[1]}"
+        fi
+    done < "$cred_file"
+    if [ "$count" -eq 0 ]; then
+        echo "  (нет пользователей)"
+    fi
+}
+
+add_user() {
+    local cred_file="${TT_DIR}/credentials.toml"
+    if [ ! -f "$cred_file" ]; then
+        log_error "credentials.toml не найден. Сначала установите TrustTunnel."
+        press_enter
+        return
+    fi
+
+    show_header
+    echo "=== ДОБАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯ ==="
+    echo ""
+    echo "Текущие пользователи:"
+    list_users
+    echo ""
+
+    local username password client_name
+    while true; do
+        read -rp "Имя пользователя: " username
+        [[ "$username" =~ ^[a-zA-Z0-9_-]+$ ]] && break
+        log_error "Только буквы, цифры, _ и -"
+    done
+
+    if grep -q "username = \"$username\"" "$cred_file"; then
+        log_error "Пользователь $username уже существует"
+        press_enter
+        return
+    fi
+
+    read -rsp "Пароль (Enter = сгенерировать): " password
+    echo ""
+    if [ -z "$password" ]; then
+        password=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 16)
+        log_info "Сгенерирован пароль: $password"
+    fi
+
+    echo "" >> "$cred_file"
+    cat >> "$cred_file" << EOF
+[[client]]
+username = "$username"
+password = "$password"
+EOF
+    chmod 600 "$cred_file"
+    log_info "Пользователь $username добавлен"
+
+    # Экспорт клиентской конфигурации
+    if [ -f "${TT_DIR}/trusttunnel_endpoint" ]; then
+        read -rp "Имя файла конфигурации [$username]: " client_name
+        client_name=${client_name:-$username}
+        local cred_file_client="/root/${client_name}_trusttunnel.toml"
+        local domain port
+        domain=$(grep -oP 'hostname\s*=\s*"\K[^"]+' "${TT_DIR}/hosts.toml" 2>/dev/null | head -1 || echo "unknown")
+        port=$(grep -oP 'listen_address\s*=\s*"[^:]+:\K[0-9]+' "${TT_DIR}/vpn.toml" 2>/dev/null || echo "443")
+
+        pushd "${TT_DIR}" > /dev/null
+        ./trusttunnel_endpoint vpn.toml hosts.toml -c "$username" -a "$domain:$port" --format toml > "$cred_file_client" 2>/dev/null || {
+            cat > "$cred_file_client" << EOF2
+endpoint = "https://$domain:$port"
+username = "$username"
+password = "$password"
+EOF2
+        }
+        chmod 600 "$cred_file_client"
+        popd > /dev/null
+
+        # QR-код
+        local deeplink
+        deeplink=$(pushd "${TT_DIR}" > /dev/null && ./trusttunnel_endpoint vpn.toml hosts.toml -c "$username" -a "$domain:$port" --format deeplink 2>/dev/null; popd > /dev/null)
+        if [ -n "$deeplink" ] && command -v qrencode &>/dev/null; then
+            echo "QR-код для $username:"
+            qrencode -t ANSIUTF8 "$deeplink" 2>/dev/null || true
+        fi
+        log_info "Клиентская конфигурация: $cred_file_client"
+    fi
+
+    # Перезапуск сервиса для применения
+    if systemctl is-active --quiet trusttunnel 2>/dev/null; then
+        read -rp "Перезапустить TrustTunnel для применения? [Y/n]: " restart
+        [[ ! "$restart" =~ ^[Nn]$ ]] && systemctl restart trusttunnel
+    fi
+    press_enter
+}
+
+remove_user() {
+    local cred_file="${TT_DIR}/credentials.toml"
+    if [ ! -f "$cred_file" ]; then
+        log_error "credentials.toml не найден"
+        press_enter
+        return
+    fi
+
+    show_header
+    echo "=== УДАЛЕНИЕ ПОЛЬЗОВАТЕЛЯ ==="
+    echo ""
+    echo "Текущие пользователи:"
+    list_users
+    echo ""
+
+    read -rp "Имя пользователя для удаления: " username
+    if ! grep -q "username = \"$username\"" "$cred_file"; then
+        log_error "Пользователь $username не найден"
+        press_enter
+        return
+    fi
+
+    read -rp "Удалить пользователя $username? [y/N]: " confirm
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        cp "$cred_file" "${BACKUP_DIR}/credentials.toml.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+        # Удаляем блок [[client]] ... с этим username
+        sed -i "/^\[\[client\]\]$/,/^$/{/username = \"$username\"/d}" "$cred_file" 2>/dev/null || true
+        # Удаляем пустые блоки и строки
+        sed -i '/^\[\[client\]\]$/{ N; /^\[\[client\]\]\n$/d; }' "$cred_file" 2>/dev/null || true
+        log_info "Пользователь $username удалён"
+        if systemctl is-active --quiet trusttunnel 2>/dev/null; then
+            read -rp "Перезапустить TrustTunnel? [Y/n]: " restart
+            [[ ! "$restart" =~ ^[Nn]$ ]] && systemctl restart trusttunnel
+        fi
+    fi
+    press_enter
+}
+
+change_user_password() {
+    local cred_file="${TT_DIR}/credentials.toml"
+    if [ ! -f "$cred_file" ]; then
+        log_error "credentials.toml не найден"
+        press_enter
+        return
+    fi
+
+    show_header
+    echo "=== СМЕНА ПАРОЛЯ ==="
+    echo ""
+    echo "Текущие пользователи:"
+    list_users
+    echo ""
+
+    read -rp "Имя пользователя: " username
+    if ! grep -q "username = \"$username\"" "$cred_file"; then
+        log_error "Пользователь $username не найден"
+        press_enter
+        return
+    fi
+
+    read -rsp "Новый пароль (Enter = сгенерировать): " newpass
+    echo ""
+    if [ -z "$newpass" ]; then
+        newpass=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 16)
+        log_info "Сгенерирован пароль: $newpass"
+    fi
+
+    cp "$cred_file" "${BACKUP_DIR}/credentials.toml.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+    sed -i "/username = \"$username\"/{n;s/password = \".*\"/password = \"$newpass\"/;}" "$cred_file"
+    log_info "Пароль для $username изменён"
+
+    # Обновить клиентский конфиг
+    local client_file
+    client_file=$(find /root -maxdepth 1 -name "*_trusttunnel.toml" -exec grep -l "username = \"$username\"" {} \; 2>/dev/null | head -1)
+    if [ -n "$client_file" ]; then
+        sed -i "s/password = \".*\"/password = \"$newpass\"/" "$client_file"
+        log_info "Клиентский конфиг $client_file обновлён"
+    fi
+
+    press_enter
+}
+
+export_client_for_user() {
+    local cred_file="${TT_DIR}/credentials.toml"
+    if [ ! -f "$cred_file" ] || [ ! -f "${TT_DIR}/trusttunnel_endpoint" ]; then
+        log_error "TrustTunnel не установлен полностью"
+        press_enter
+        return
+    fi
+
+    show_header
+    echo "=== ЭКСПОРТ КЛИЕНТСКОЙ КОНФИГУРАЦИИ ==="
+    echo ""
+    echo "Текущие пользователи:"
+    list_users
+    echo ""
+
+    read -rp "Имя пользователя: " username
+    if ! grep -q "username = \"$username\"" "$cred_file"; then
+        log_error "Пользователь $username не найден"
+        press_enter
+        return
+    fi
+
+    local domain port
+    domain=$(grep -oP 'hostname\s*=\s*"\K[^"]+' "${TT_DIR}/hosts.toml" 2>/dev/null | head -1 || echo "unknown")
+    port=$(grep -oP 'listen_address\s*=\s*"[^:]+:\K[0-9]+' "${TT_DIR}/vpn.toml" 2>/dev/null || echo "443")
+
+    local outfile="/root/${username}_trusttunnel.toml"
+    pushd "${TT_DIR}" > /dev/null
+    ./trusttunnel_endpoint vpn.toml hosts.toml -c "$username" -a "$domain:$port" --format toml > "$outfile" 2>/dev/null || {
+        local password
+        password=$(grep -A1 "username = \"$username\"" "$cred_file" | grep -oP 'password\s*=\s*"\K[^"]+')
+        cat > "$outfile" << EOF2
+endpoint = "https://$domain:$port"
+username = "$username"
+password = "$password"
+EOF2
+    }
+    chmod 600 "$outfile"
+    popd > /dev/null
+
+    log_info "Конфигурация сохранена: $outfile"
+
+    local deeplink
+    deeplink=$(pushd "${TT_DIR}" > /dev/null && ./trusttunnel_endpoint vpn.toml hosts.toml -c "$username" -a "$domain:$port" --format deeplink 2>/dev/null; popd > /dev/null)
+    if [ -n "$deeplink" ]; then
+        echo "Deep Link: $deeplink"
+        if command -v qrencode &>/dev/null; then
+            qrencode -t ANSIUTF8 "$deeplink" 2>/dev/null || true
+        fi
+    fi
+    press_enter
+}
+
+user_management_menu() {
+    while true; do
+        show_header
+        echo "=== УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯМИ ==="
+        echo ""
+        if [ -f "${TT_DIR}/credentials.toml" ]; then
+            list_users
+        else
+            echo "  (credentials.toml не найден — TrustTunnel не установлен)"
+        fi
+        echo ""
+        echo "  1) Добавить пользователя"
+        echo "  2) Удалить пользователя"
+        echo "  3) Сменить пароль"
+        echo "  4) Экспортировать клиентскую конфигурацию"
+        echo ""
+        echo "  0) Назад"
+        echo ""
+        read -rp "Выберите пункт [0-4]: " choice
+
+        case "$choice" in
+            1) add_user ;;
+            2) remove_user ;;
+            3) change_user_password ;;
+            4) export_client_for_user ;;
+            0) return ;;
+            *) log_warn "Неверный выбор" && sleep 1 ;;
+        esac
+    done
+}
+
+# -------- CERTIFICATES --------
+
+certificate_menu() {
+    while true; do
+        show_header
+        echo "=== СЕРТИФИКАТЫ LET'S ENCRYPT ==="
+        echo ""
+
+        # Показываем домены из hosts.toml
+        if [ -f "${TT_DIR}/hosts.toml" ]; then
+            local domains
+            domains=$(grep -oP 'hostname\s*=\s*"\K[^"]+' "${TT_DIR}/hosts.toml" 2>/dev/null || echo "")
+            if [ -n "$domains" ]; then
+                echo "Домены в конфигурации:"
+                echo "$domains" | while read -r d; do echo "  - $d"; done
+                echo ""
+            fi
+        fi
+
+        # Статус сертификатов
+        if command -v certbot &>/dev/null; then
+            echo "Сертификаты certbot:"
+            certbot certificates 2>/dev/null | grep -E 'Domains:|Expiry Date:|VALID' || echo "  (нет сертификатов)"
+        fi
+        echo ""
+        echo "  1) Проверить срок действия сертификатов"
+        echo "  2) Принудительно обновить сертификаты"
+        echo "  3) Информация о сертификате (openssl)"
+        echo "  4) Dry-run проверка автообновления"
+        echo ""
+        echo "  0) Назад"
+        echo ""
+        read -rp "Выберите пункт [0-4]: " choice
+
+        case "$choice" in
+            1)
+                if command -v certbot &>/dev/null; then
+                    certbot certificates 2>/dev/null || log_warn "Нет сертификатов или certbot не настроен"
+                else
+                    log_error "certbot не установлен"
+                fi
+                press_enter
+                ;;
+            2)
+                log_info "Принудительное обновление сертификатов..."
+                certbot renew --force-renewal 2>&1 || log_error "Ошибка обновления"
+                if systemctl is-active --quiet trusttunnel 2>/dev/null; then
+                    systemctl restart trusttunnel
+                    log_info "TrustTunnel перезапущен с новыми сертификатами"
+                fi
+                press_enter
+                ;;
+            3)
+                read -rp "Домен (Enter = автоопределение): " domain
+                if [ -z "$domain" ]; then
+                    domain=$(grep -oP 'hostname\s*=\s*"\K[^"]+' "${TT_DIR}/hosts.toml" 2>/dev/null | head -1 || echo "")
+                fi
+                local cert_path="/etc/letsencrypt/live/$domain/fullchain.pem"
+                if [ -f "$cert_path" ]; then
+                    openssl x509 -in "$cert_path" -text -noout | grep -E 'Subject:|Issuer:|Not Before|Not After|DNS:' || true
+                else
+                    log_error "Сертификат для $domain не найден"
+                fi
+                press_enter
+                ;;
+            4)
+                log_info "Тестирование автообновления (dry-run)..."
+                certbot renew --dry-run 2>&1 || log_warn "Dry-run завершился с ошибкой (может быть нормально для свежих сертификатов)"
+                press_enter
+                ;;
+            0) return ;;
+            *) log_warn "Неверный выбор" && sleep 1 ;;
+        esac
+    done
+}
+
+# -------- SERVICE CONTROL --------
+
+service_menu() {
+    while true; do
+        show_header
+        echo "=== УПРАВЛЕНИЕ СЕРВИСОМ ==="
+        echo ""
+
+        local svc_active="остановлен"
+        local svc_color="$RED"
+        if systemctl is-active --quiet trusttunnel 2>/dev/null; then
+            svc_active="активен"
+            svc_color="$GREEN"
+        fi
+        echo -e "Статус: ${svc_color}${svc_active}${NC}"
+        echo ""
+
+        echo "  1) Запустить"
+        echo "  2) Остановить"
+        echo "  3) Перезапустить"
+        echo "  4) Статус (подробно)"
+        echo "  5) Логи (последние 50 строк)"
+        echo "  6) Логи в реальном времени (Ctrl+C для выхода)"
+        echo "  7) Проверить порты"
+        echo ""
+        echo "  0) Назад"
+        echo ""
+        read -rp "Выберите пункт [0-7]: " choice
+
+        case "$choice" in
+            1)
+                systemctl start trusttunnel 2>/dev/null && log_info "Сервис запущен" || log_error "Ошибка запуска"
+                press_enter
+                ;;
+            2)
+                systemctl stop trusttunnel 2>/dev/null && log_info "Сервис остановлен" || log_error "Ошибка остановки"
+                press_enter
+                ;;
+            3)
+                systemctl restart trusttunnel 2>/dev/null && log_info "Сервис перезапущен" || log_error "Ошибка перезапуска"
+                press_enter
+                ;;
+            4)
+                systemctl status trusttunnel 2>/dev/null || log_error "Сервис не найден"
+                press_enter
+                ;;
+            5)
+                journalctl -u trusttunnel -n 50 --no-pager 2>/dev/null || log_error "Логи не найдены"
+                press_enter
+                ;;
+            6)
+                log_info "Логи в реальном времени (Ctrl+C для выхода)..."
+                journalctl -u trusttunnel -f 2>/dev/null || log_error "Логи не найдены"
+                ;;
+            7)
+                echo ""
+                echo "Открытые порты TrustTunnel:"
+                local port
+                port=$(grep -oP 'listen_address\s*=\s*"[^:]+:\K[0-9]+' "${TT_DIR}/vpn.toml" 2>/dev/null || echo "")
+                if [ -n "$port" ]; then
+                    ss -tlnp 2>/dev/null | grep ":$port " || echo "  (порт $port не слушается)"
+                    echo ""
+                    ss -ulnp 2>/dev/null | grep ":$port " || echo "  (UDP порт $port не слушается)"
+                else
+                    log_warn "Не удалось определить порт из конфигурации"
+                fi
+                press_enter
+                ;;
+            0) return ;;
+            *) log_warn "Неверный выбор" && sleep 1 ;;
+        esac
+    done
+}
+
+# -------- STATUS --------
+
+show_status() {
+    show_header
+    echo "=== СТАТУС СИСТЕМЫ ==="
+    echo ""
+
+    # Сервис
+    echo -n "Сервис:     "
+    if systemctl is-active --quiet trusttunnel 2>/dev/null; then
+        echo -e "${GREEN}активен${NC}"
+        local uptime_str
+        uptime_str=$(systemctl show trusttunnel -p ActiveEnterTimestamp 2>/dev/null | cut -d= -f2 || echo "неизвестно")
+        echo "  Запущен:  $uptime_str"
+    else
+        echo -e "${RED}остановлен${NC}"
+    fi
+
+    # Конфигурация
+    if [ -f "${TT_DIR}/vpn.toml" ]; then
+        local port domain
+        port=$(grep -oP 'listen_address\s*=\s*"[^:]+:\K[0-9]+' "${TT_DIR}/vpn.toml" 2>/dev/null || echo "?")
+        echo "Порт:       $port"
+    fi
+    if [ -f "${TT_DIR}/hosts.toml" ]; then
+        local domain
+        domain=$(grep -oP 'hostname\s*=\s*"\K[^"]+' "${TT_DIR}/hosts.toml" 2>/dev/null | head -1 || echo "?")
+        echo "Домен:      $domain"
+    fi
+
+    # Пользователи
+    if [ -f "${TT_DIR}/credentials.toml" ]; then
+        local user_count
+        user_count=$(grep -c 'username' "${TT_DIR}/credentials.toml" 2>/dev/null || echo "0")
+        echo "Клиентов:   $user_count"
+    fi
+
+    # Сертификат
+    if [ -f "${TT_DIR}/hosts.toml" ]; then
+        local domain cert_path
+        domain=$(grep -oP 'hostname\s*=\s*"\K[^"]+' "${TT_DIR}/hosts.toml" 2>/dev/null | head -1 || echo "")
+        cert_path="/etc/letsencrypt/live/$domain/fullchain.pem"
+        if [ -f "$cert_path" ]; then
+            local expiry
+            expiry=$(openssl x509 -enddate -noout -in "$cert_path" 2>/dev/null | cut -d= -f2 || echo "?")
+            echo "Сертификат: до $expiry"
+        else
+            echo "Сертификат: ${RED}не найден${NC}"
+        fi
+    fi
+
+    # Диск
+    if [ -d "$TT_DIR" ]; then
+        local disk_usage
+        disk_usage=$(du -sh "$TT_DIR" 2>/dev/null | cut -f1 || echo "?")
+        echo "Диск:       $disk_usage (/opt/trusttunnel)"
+    fi
+
+    # Версия бинарника
+    if [ -f "${TT_DIR}/trusttunnel_endpoint" ]; then
+        local version
+        version=$("${TT_DIR}/trusttunnel_endpoint" --version 2>/dev/null | head -1 || echo "неизвестна")
+        echo "Версия:     $version"
+    fi
+
+    # Память
+    if pidof trusttunnel_endpoint &>/dev/null; then
+        local pid mem
+        pid=$(pidof trusttunnel_endpoint 2>/dev/null || echo "")
+        if [ -n "$pid" ]; then
+            mem=$(ps -o rss= -p "$pid" 2>/dev/null | awk '{printf "%.1f MB", $1/1024}' || echo "?")
+            echo "PID:        $pid"
+            echo "Память:     $mem"
+        fi
+    fi
+
+    # Автообновление
+    echo ""
+    echo "Автообновление:"
+    if systemctl is-active --quiet trusttunnel-update.timer 2>/dev/null; then
+        echo -e "  Таймер: ${GREEN}активен${NC}"
+    else
+        echo -e "  Таймер: остановлен"
+    fi
+    if [ -f /etc/cron.d/trusttunnel-auto-update ]; then
+        echo "  Cron:    настроен"
+    fi
+
+    echo ""
+    press_enter
+}
+
+# -------- UPDATE --------
+
+update_trusttunnel() {
+    show_header
+    echo "=== ОБНОВЛЕНИЕ TRUSTTUNNEL ==="
+    echo ""
+
+    if [ ! -f "${TT_DIR}/trusttunnel_endpoint" ]; then
+        log_error "TrustTunnel не установлен. Выполните полную установку."
+        press_enter
+        return
+    fi
+
+    local current_ver
+    current_ver=$("${TT_DIR}/trusttunnel_endpoint" --version 2>/dev/null | head -1 || echo "неизвестна")
+    echo "Текущая версия: $current_ver"
+    echo ""
+
+    read -rp "Проверить и установить обновление? [y/N]: " do_update
+    if [[ ! "$do_update" =~ ^[Yy]$ ]]; then
+        return
+    fi
+
+    if [ -f "${TT_DIR}/trusttunnel-auto-update.sh" ]; then
+        log_info "Запускаем скрипт автообновления..."
+        bash "${TT_DIR}/trusttunnel-auto-update.sh"
+    else
+        log_info "Скрипт автообновления не найден, выполняем ручное обновление..."
+        systemctl stop trusttunnel 2>/dev/null || true
+        rm -rf "${TT_DIR}/trusttunnel_endpoint" 2>/dev/null || true
+        install_trusttunnel
+        if systemctl is-enabled trusttunnel &>/dev/null; then
+            systemctl restart trusttunnel
+        fi
+    fi
+    press_enter
+}
+
+# -------- MAIN MENU --------
+
+show_main_menu() {
+    while true; do
+        show_header
+
+        # Компактный статус
+        if systemctl is-active --quiet trusttunnel 2>/dev/null; then
+            echo -e "  Сервис: ${GREEN}● активен${NC}"
+        else
+            echo -e "  Сервис: ${RED}● остановлен${NC}"
+        fi
+        if [ -f "${TT_DIR}/credentials.toml" ]; then
+            local uc
+            uc=$(grep -c 'username' "${TT_DIR}/credentials.toml" 2>/dev/null || echo "0")
+            echo "  Клиентов: $uc"
+        fi
+        echo ""
+
+        echo "  ${BOLD}1)${NC} Установить / переустановить TrustTunnel"
+        echo "  ${BOLD}2)${NC} Настройка (пресеты / правила / конфигурация)"
+        echo "  ${BOLD}3)${NC} Пользователи (добавить / удалить / пароль / экспорт)"
+        echo "  ${BOLD}4)${NC} Сертификаты (статус / продление / информация)"
+        echo "  ${BOLD}5)${NC} Сервис (запуск / остановка / логи / порты)"
+        echo "  ${BOLD}6)${NC} Обновить TrustTunnel"
+        echo "  ${BOLD}7)${NC} Статус системы"
+        echo ""
+        echo "  ${RED}8)${NC} Полное удаление TrustTunnel"
+        echo "  ${BOLD}0)${NC} Выход"
+        echo ""
+        read -rp "Выберите пункт [0-8]: " choice
+
+        case "$choice" in
+            1) full_install ;;
+            2) reconfigure_menu ;;
+            3) user_management_menu ;;
+            4) certificate_menu ;;
+            5) service_menu ;;
+            6) update_trusttunnel ;;
+            7) show_status ;;
+            8) uninstall_trusttunnel ;;
+            0) echo ""; echo "До свидания!"; exit 0 ;;
+            *) log_warn "Неверный выбор" && sleep 1 ;;
+        esac
+    done
+}
+
+# ===========================
+# MAIN
+# ===========================
+main() {
+    # Обработка аргументов командной строки
+    if [ "${1:-}" = "--uninstall" ]; then
+        check_root
+        uninstall_trusttunnel
+        exit 0
+    fi
+    if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+        echo "Использование:"
+        echo "  bash setup_trusttunnel_v2.sh               Интерактивное меню управления"
+        echo "  bash setup_trusttunnel_v2.sh --uninstall   Полностью удалить TrustTunnel"
+        exit 0
+    fi
+
+    check_root
+    check_tty
+    show_main_menu
 }
 
 main "$@"
