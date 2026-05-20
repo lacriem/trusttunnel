@@ -1,4 +1,4 @@
-# TrustTunnel VPN Manager
+# TrustTunnel VPN Manager v2
 
 Автоматический скрипт для развёртывания и управления [TrustTunnel](https://github.com/TrustTunnel/TrustTunnel) VPN на Ubuntu/Debian.
 
@@ -42,9 +42,9 @@ bash setup_trusttunnel_v2.sh --help        # Справка
 ## Меню
 
 ```
-╔══════════════════════════════════════════════╗
-║        TRUSTTUNNEL VPN MANAGER v2            ║
-╚══════════════════════════════════════════════╝
+    ╔══════════════════════════════════════════════╗
+    ║  ▓▓▓ TRUSTTUNNEL VPN MANAGER v2 ▓▓▓          ║
+    ╚══════════════════════════════════════════════╝
 
   1) Установить / переустановить TrustTunnel
   2) Настройка (пресеты / правила / конфигурация)

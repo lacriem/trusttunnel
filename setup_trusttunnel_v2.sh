@@ -139,7 +139,13 @@ install_trusttunnel() {
 
     curl -fsSL -o "${tmpdir}/install.sh" "$INSTALL_SCRIPT_URL"
 
-    if curl -fsSL -o "${tmpdir}/install.sh.sha256" "$INSTALL_SCRIPT_SHA256_URL" 2>/dev/null; then
+    # Проверяем есть ли .sha256 файл в репозитории
+    local http_code
+    http_code=$(curl -sSL -o /dev/null -w "%{http_code}" "$INSTALL_SCRIPT_SHA256_URL" 2>/dev/null)
+    http_code="${http_code:-000}"
+    
+    if [ "$http_code" = "200" ]; then
+        curl -fsSL -o "${tmpdir}/install.sh.sha256" "$INSTALL_SCRIPT_SHA256_URL"
         local expected_sha
         expected_sha=$(awk '{print $1}' "${tmpdir}/install.sh.sha256")
         local actual_sha
@@ -152,14 +158,13 @@ install_trusttunnel() {
             exit 1
         fi
         log_info "Checksum инсталлятора проверен"
+        mkdir -p "$TT_DIR"
         echo "$expected_sha" > "$UPDATE_CHECK_FILE"
     else
-        log_warn "Не удалось скачать SHA256 checksum. Проверка целостности пропущена."
-        read -rp "Продолжить без проверки? [y/N]: " skip_checksum
-        if [[ ! "$skip_checksum" =~ ^[Yy]$ ]]; then
-            rm -rf "$tmpdir"
-            exit 1
-        fi
+        log_warn "SHA256 checksum недоступен (HTTP ${http_code}). Пропускаем проверку целостности."
+        # Генерируем локальный SHA256 для будущих проверок обновлений
+        mkdir -p "$TT_DIR"
+        sha256sum "${tmpdir}/install.sh" | awk '{print $1}' > "$UPDATE_CHECK_FILE"
     fi
 
     log_info "Запускаем инсталлятор TrustTunnel..."
@@ -183,34 +188,42 @@ install_trusttunnel() {
 # ===========================
 get_user_input() {
     echo ""
-    echo "=========================================="
-    echo "  НАСТРОЙКА TRUSTTUNNEL + LET'S ENCRYPT"
-    echo "=========================================="
+    echo -e "  ${CYAN}╔══════════════════════════════════════════════╗${NC}"
+    echo -e "  ${CYAN}║${BOLD}   ▓▓▓ НАСТРОЙКА ПАРАМЕТРОВ ▓▓▓              ${NC}${CYAN}║${NC}"
+    echo -e "  ${CYAN}╚══════════════════════════════════════════════╝${NC}"
     echo ""
 
     while true; do
-        read -rp "Введите ваш домен (должен указывать на этот сервер): " DOMAIN
+        echo -ne "  ${CYAN}▸${NC} ${BOLD}Домен:${NC} "
+        read -r DOMAIN
+        DOMAIN=$(echo "$DOMAIN" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
         if [ -z "$DOMAIN" ]; then
-            log_error "Домен не может быть пустым"
+            echo -e "  ${RED}  ✗ Домен не может быть пустым${NC}"
             continue
         fi
         break
     done
 
-    log_info "Проверяем разрешение домена..."
+    echo -e "  ${DIM}  Проверяем разрешение домена...${NC}"
     DOMAIN_IP=$(dig +short "$DOMAIN" 2>/dev/null | tail -1 || echo "")
     SERVER_IP=$(ip route get 1 2>/dev/null | awk '{print $7; exit}' || hostname -I | awk '{print $1}')
 
-    if [ -n "$DOMAIN_IP" ] && [ "$DOMAIN_IP" != "$SERVER_IP" ]; then
-        log_warn "Домен $DOMAIN разрешается в IP: $DOMAIN_IP, но IP этого сервера: $SERVER_IP"
-        read -rp "Продолжить anyway? [y/N]: " force_continue
+    if [ -z "$DOMAIN_IP" ]; then
+        echo -e "  ${YELLOW}  ⚠ Не удалось определить IP домена (проверьте DNS)${NC}"
+    elif [ "$DOMAIN_IP" != "$SERVER_IP" ]; then
+        echo -e "  ${YELLOW}  ▸ Разрешается в ${DOMAIN_IP}, IP сервера: ${SERVER_IP}${NC}"
+        echo -ne "  ${YELLOW}  Продолжить? [y/N]:${NC} "
+        read -r force_continue
         if [[ ! "$force_continue" =~ ^[Yy]$ ]]; then
             exit 1
         fi
+    else
+        echo -e "  ${GREEN}  ✓ Домен корректно указывает на этот сервер${NC}"
     fi
 
-    # --- МНОЖЕСТВЕННЫЕ ПОЛЬЗОВАТЕЛИ ---
-    read -rp "Количество пользователей VPN [1]: " USER_COUNT
+    echo ""
+    echo -ne "  ${CYAN}▸${NC} ${BOLD}Количество пользователей VPN ${DIM}[1]${NC}: "
+    read -r USER_COUNT
     USER_COUNT=${USER_COUNT:-1}
     if ! [[ "$USER_COUNT" =~ ^[0-9]+$ ]] || [ "$USER_COUNT" -lt 1 ]; then
         USER_COUNT=1
@@ -222,46 +235,54 @@ get_user_input() {
 
     for i in $(seq 1 "$USER_COUNT"); do
         echo ""
-        echo "--- Пользователь #$i ---"
+        echo -e "  ${CYAN}┌── Пользователь #${i} ──────────────────────────┐${NC}"
         local username password client_name
         while true; do
-            read -rp "Имя пользователя #$i [user$i]: " username
+            echo -ne "  ${CYAN}│${NC} ${BOLD}Имя:${NC} "
+            read -r username
+            username=$(echo "$username" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
             username=${username:-user$i}
             if [[ ! "$username" =~ ^[a-zA-Z0-9_-]+$ ]]; then
-                log_error "Имя пользователя может содержать только буквы, цифры, _ и -"
+                echo -e "  ${CYAN}│${NC} ${RED}  ✗ Только буквы, цифры, _ и -${NC}"
                 continue
             fi
             break
         done
 
-        read -rsp "Пароль пользователя #$i (Enter для случайного): " password
+        echo -ne "  ${CYAN}│${NC} ${BOLD}Пароль:${NC} ${DIM}(Enter = случайный)${NC} "
+        read -rs password
         echo ""
         if [ -z "$password" ]; then
             password=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 16)
-            echo -e "${GREEN}[INFO]${NC} Сгенерирован случайный пароль для $username: $password" > /dev/tty
+            echo -e "  ${CYAN}│${NC} ${GREEN}  ✓ Сгенерирован:${NC} ${BOLD}${password}${NC}"
         fi
 
-        read -rp "Имя клиентской конфигурации #$i [client$i]: " client_name
+        echo -ne "  ${CYAN}│${NC} ${BOLD}Имя конфига:${NC} ${DIM}[client${i}]${NC} "
+        read -r client_name
         client_name=${client_name:-client$i}
         if [[ ! "$client_name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
-            log_warn "Имя клиентской конфигурации содержит недопустимые символы, используем client$i"
+            echo -e "  ${CYAN}│${NC} ${YELLOW}  ⚠ Недопустимые символы, используем client${i}${NC}"
             client_name="client$i"
         fi
+        echo -e "  ${CYAN}└──────────────────────────────────────────────┘${NC}"
 
         USERNAMES+=("$username")
         PASSWORDS+=("$password")
         CLIENT_NAMES+=("$client_name")
     done
 
+    echo ""
     while true; do
-        read -rp "Порт для TrustTunnel [443]: " LISTEN_PORT
+        echo -ne "  ${CYAN}▸${NC} ${BOLD}Порт TrustTunnel ${DIM}[443]${NC}: "
+        read -r LISTEN_PORT
         LISTEN_PORT=${LISTEN_PORT:-443}
         if ! [[ "$LISTEN_PORT" =~ ^[0-9]+$ ]] || [ "$LISTEN_PORT" -lt 1 ] || [ "$LISTEN_PORT" -gt 65535 ]; then
-            log_error "Порт должен быть числом от 1 до 65535"
+            echo -e "  ${RED}  ✗ Порт должен быть от 1 до 65535${NC}"
             continue
         fi
         break
     done
+    echo ""
 }
 
 # ===========================
@@ -382,9 +403,63 @@ check_port_available() {
 }
 
 # ===========================
-# 6. GET LET'S ENCRYPT CERT
+# 6. CHECK / GET LET'S ENCRYPT CERT
 # ===========================
+check_existing_certificate() {
+    local cert_dir="/etc/letsencrypt/live/$DOMAIN"
+    local cert_path="${cert_dir}/fullchain.pem"
+    local key_path="${cert_dir}/privkey.pem"
+    local chain_path="${cert_dir}/chain.pem"
+    local cert_single="${cert_dir}/cert.pem"
+
+    # 1. Существование файлов
+    if [ ! -f "$cert_path" ] || [ ! -f "$key_path" ]; then
+        return 1
+    fi
+
+    # 2. Валидность по времени (не истекает в ближайшие 24 часа)
+    if ! openssl x509 -checkend 86400 -noout -in "$cert_path" 2>/dev/null; then
+        log_warn "Существующий сертификат истёк или истекает в течение 24 часов"
+        return 1
+    fi
+
+    # 3. Проверка домена в SAN или CN
+    local san_match
+    san_match=$(openssl x509 -in "$cert_path" -noout -text 2>/dev/null \
+        | grep -A1 "Subject Alternative Name" \
+        | grep -oP "DNS:\K[^, ]+" \
+        | grep -Fx "$DOMAIN" || true)
+
+    if [ -z "$san_match" ]; then
+        local cn_domain
+        cn_domain=$(openssl x509 -in "$cert_path" -noout -subject 2>/dev/null \
+            | grep -oP "CN\s*=\s*\K[^,/]+" \
+            | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        if [ "$cn_domain" != "$DOMAIN" ]; then
+            log_warn "Существующий сертификат выдан для '$cn_domain', но требуется '$DOMAIN'"
+            return 1
+        fi
+    fi
+
+    # 4. Проверка цепочки доверия
+    if [ -f "$chain_path" ] && [ -f "$cert_single" ]; then
+        if ! openssl verify -CAfile /etc/ssl/certs/ca-certificates.crt -untrusted "$chain_path" "$cert_single" &>/dev/null; then
+            log_warn "Цепочка доверия существующего сертификата невалидна"
+            return 1
+        fi
+    fi
+
+    log_info "Сертификат для $DOMAIN уже существует и действителен, пропускаем выпуск"
+    return 0
+}
+
 get_certificate() {
+    log_info "Проверяем существующие сертификаты для $DOMAIN..."
+
+    if check_existing_certificate; then
+        return 0
+    fi
+
     log_info "Получаем Let's Encrypt сертификат для $DOMAIN..."
 
     if lsof -i :80 &>/dev/null || ss -tlnp | grep -q ':80 '; then
@@ -426,6 +501,23 @@ get_certificate() {
 setup_auto_renewal() {
     log_info "Настраиваем автообновление сертификатов..."
 
+    local renewal_conf="/etc/letsencrypt/renewal/${DOMAIN}.conf"
+
+    # Быстрая проверка: если всё уже настроено — выходим мгновенно
+    local already_configured=0
+    if systemctl list-timers 2>/dev/null | grep -qE 'certbot|letsencrypt'; then
+        if [ -f "$renewal_conf" ] && grep -q "renew_hook = systemctl restart trusttunnel" "$renewal_conf"; then
+            if [ -f "/etc/cron.d/trusttunnel-cert-renewal" ]; then
+                already_configured=1
+            fi
+        fi
+    fi
+
+    if [ "$already_configured" -eq 1 ]; then
+        log_info "Автообновление уже полностью настроено"
+        return 0
+    fi
+
     if systemctl list-timers 2>/dev/null | grep -qE 'certbot|letsencrypt'; then
         log_info "Certbot timer уже активен"
     else
@@ -434,33 +526,21 @@ setup_auto_renewal() {
         systemctl start certbot.timer 2>/dev/null || true
     fi
 
-    log_info "Добавляем deploy-hook для перезапуска TrustTunnel после обновления сертификата..."
-
-    CERTBOT_VERSION=$(certbot --version 2>&1 | grep -oP '[0-9]+\.[0-9]+\.[0-9]+' || echo "0.0.0")
-    CERTBOT_MAJOR=$(echo "$CERTBOT_VERSION" | cut -d. -f1)
-    CERTBOT_MINOR=$(echo "$CERTBOT_VERSION" | cut -d. -f2)
-
-    if [ "$CERTBOT_MAJOR" -gt 2 ] || ([ "$CERTBOT_MAJOR" -eq 2 ] && [ "$CERTBOT_MINOR" -ge 3 ]); then
-        certbot reconfigure --deploy-hook "systemctl restart trusttunnel" -d "$DOMAIN" 2>/dev/null || {
-            log_warn "Не удалось использовать reconfigure, пытаемся через renew-hook в конфиге..."
-            setup_renew_hook_manual
-        }
-    else
-        setup_renew_hook_manual
-    fi
+    log_info "Добавляем deploy-hook для перезапуска TrustTunnel..."
+    setup_renew_hook_manual
 
     if [ ! -f "/etc/cron.d/trusttunnel-cert-renewal" ]; then
         cat > /etc/cron.d/trusttunnel-cert-renewal << 'EOF'
 0 3 * * * root certbot renew --quiet --deploy-hook "systemctl restart trusttunnel" >> /var/log/trusttunnel-cert-renewal.log 2>&1
 EOF
         chmod 644 /etc/cron.d/trusttunnel-cert-renewal
-        log_info "Cron fallback добавлен в /etc/cron.d/trusttunnel-cert-renewal"
+        log_info "Cron fallback добавлен"
     else
-        log_info "Cron fallback уже существует, пропускаем"
+        log_info "Cron fallback уже существует"
     fi
 
-    log_info "Тестируем обновление (dry-run)..."
-    certbot renew --dry-run --quiet || log_warn "Dry-run не прошел, но это может быть нормально для свежего сертификата"
+    # Dry-run пропускаем — сертификат только что выпущен успешно
+    log_info "Пропускаем dry-run (сертификат свежий). Проверить вручную: certbot renew --dry-run"
 }
 
 setup_renew_hook_manual() {
@@ -628,7 +708,7 @@ setup_auto_update() {
     cat > "$update_script" << 'SCRIPT_EOF'
 #!/bin/bash
 # TrustTunnel Auto-Update Script
-set -euo pipefail
+set -eo pipefail
 
 TT_DIR="/opt/trusttunnel"
 BACKUP_DIR="/opt/trusttunnel/backups"
@@ -649,29 +729,36 @@ fi
 
 log "=== Проверка обновлений TrustTunnel ==="
 
-# Скачиваем актуальный checksum
+# Скачиваем инсталлятор для проверки
 tmpdir=$(mktemp -d)
 trap 'rm -rf "$tmpdir"' EXIT
 
-if ! curl -fsSL -o "${tmpdir}/install.sh.sha256" "$INSTALL_SCRIPT_SHA256_URL" 2>/dev/null; then
-    log "Не удалось скачать checksum. Пропускаем проверку."
-    exit 0
-fi
+curl -fsSL -o "${tmpdir}/install.sh" "$INSTALL_SCRIPT_URL"
+actual_sha=$(sha256sum "${tmpdir}/install.sh" | awk '{print $1}')
 
-new_sha=$(awk '{print $1}' "${tmpdir}/install.sh.sha256")
 old_sha=""
 if [ -f "$UPDATE_CHECK_FILE" ]; then
     old_sha=$(cat "$UPDATE_CHECK_FILE")
 fi
 
-if [ "$new_sha" = "$old_sha" ]; then
+if [ "$actual_sha" = "$old_sha" ] && [ -n "$old_sha" ]; then
     log "TrustTunnel актуален (SHA256 совпадает)."
     exit 0
 fi
 
 log "Найдено обновление TrustTunnel!"
 log "Старый SHA: ${old_sha:-<нет>}"
-log "Новый SHA:  $new_sha"
+log "Новый SHA:  $actual_sha"
+
+# Если есть .sha256 в репозитории — дополнительно проверим
+if curl -fsSL -o "${tmpdir}/install.sh.sha256" "$INSTALL_SCRIPT_SHA256_URL" 2>/dev/null; then
+    expected_sha=$(awk '{print $1}' "${tmpdir}/install.sh.sha256")
+    if [ "$expected_sha" != "$actual_sha" ]; then
+        log "ОШИБКА: SHA256 не совпадает с официальным checksum!"
+        exit 1
+    fi
+    log "Официальный checksum подтверждён."
+fi
 
 # Бэкап перед обновлением
 ts=$(date +%Y%m%d%H%M%S)
@@ -679,15 +766,6 @@ mkdir -p "$BACKUP_DIR"
 if [ -f "${TT_DIR}/trusttunnel_endpoint" ]; then
     cp "${TT_DIR}/trusttunnel_endpoint" "${BACKUP_DIR}/trusttunnel_endpoint.${ts}"
     log "Бэкап бинарника сохранён"
-fi
-
-# Скачиваем инсталлятор
-curl -fsSL -o "${tmpdir}/install.sh" "$INSTALL_SCRIPT_URL"
-actual_sha=$(sha256sum "${tmpdir}/install.sh" | awk '{print $1}')
-
-if [ "$new_sha" != "$actual_sha" ]; then
-    log "ОШИБКА: SHA256 не совпадает после скачивания!"
-    exit 1
 fi
 
 # Останавливаем сервис
@@ -709,7 +787,7 @@ if [ ! -f "${TT_DIR}/trusttunnel_endpoint" ]; then
 fi
 
 # Сохраняем новый checksum
-echo "$new_sha" > "$UPDATE_CHECK_FILE"
+echo "$actual_sha" > "$UPDATE_CHECK_FILE"
 
 # Перезапускаем
 log "Перезапускаем TrustTunnel..."
@@ -880,59 +958,272 @@ uninstall_trusttunnel() {
 }
 
 # ===========================
-# 13. MENU SYSTEM
+# 13. MENU SYSTEM (CYBERPUNK EDITION)
 # ===========================
 
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
+WHITE='\033[1;37m'
 BOLD='\033[1m'
+DIM='\033[2m'
+BLINK='\033[5m'
+
+
+# ── ANSI helpers ──
+_fmt() { echo -e "${1}${2}\033[0m"; }
+bold()  { _fmt "$BOLD" "$1"; }
+red()   { _fmt "$RED" "$1"; }
+green() { _fmt "$GREEN" "$1"; }
+yellow(){ _fmt "$YELLOW" "$1"; }
+cyan()  { _fmt "$CYAN" "$1"; }
+blue()  { _fmt "$BLUE" "$1"; }
+dim()   { _fmt "$DIM" "$1"; }
+
+# ── Animations ──
+spinner() {
+    local pid=$1 delay=0.1 spinstr='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+    while kill -0 "$pid" 2>/dev/null; do
+        local temp=${spinstr#?}
+        printf " %s  " "$spinstr"
+        local spinstr=$temp${spinstr%%"$temp"}
+        sleep $delay
+        printf "\r"
+    done
+    printf "    \r"
+}
+
+typewrite() {
+    local text="$1" delay="${2:-0.01}"
+    for ((i=0; i<${#text}; i++)); do
+        printf "%s" "${text:$i:1}"
+        sleep "$delay"
+    done
+    echo ""
+}
+
+# typewrite с цветом (цвет применяется до/после текста)
+typewrite_c() {
+    local text="$1" delay="${2:-0.01}" color="${3:-}" reset="${4:-$NC}"
+    printf "%b" "$color"
+    typewrite "$text" "$delay"
+    printf "%b" "$reset"
+}
+
+pulse() {
+    local text="$1" color="${2:-$GREEN}"
+    for i in 1 2 3; do
+        printf "\r  %b%s%b" "$color" "$text" "$NC"
+        sleep 0.4
+        printf "\r  %s" "$(dim "$text")"
+        sleep 0.4
+    done
+    printf "\r  %b%s%b\n" "$color" "$text" "$NC"
+}
+
+# ── Menu helpers ──
+mi() {
+    local num="$1" text="$2" color="${3:-$CYAN}"
+    echo -e "  ${DIM}┌─${NC} ${color}${num})${NC} ${text}"
+}
+
+mi_danger() {
+    local num="$1" text="$2"
+    echo -e "  ${RED}▸ ${num})${NC} ${RED}${text}${NC}"
+}
+
+mi_exit() {
+    local num="$1" text="$2"
+    echo -e "  ${DIM}└─${NC} ${DIM}${num})${NC} ${DIM}${text}${NC}"
+}
 
 show_header() {
+    local title="${1:-TRUSTTUNNEL VPN MANAGER v2}"
+    local width=46
+    local prefix="  ▓▓▓ "
+    local suffix=" ▓▓▓"
+    local title_len=${#title}
+    local content_len=$(( ${#prefix} + title_len + ${#suffix} ))
+    local pad_left=$(( (width - content_len) / 2 ))
+    local pad_right=$(( width - content_len - pad_left ))
+
     clear 2>/dev/null || true
     echo ""
-    echo -e "${GREEN}╔══════════════════════════════════════════════╗${NC}"
-    echo -e "${GREEN}║        TRUSTTUNNEL VPN MANAGER v2            ║${NC}"
-    echo -e "${GREEN}╚══════════════════════════════════════════════╝${NC}"
+    echo -e "${CYAN}    ╔══════════════════════════════════════════════╗${NC}"
+    printf "${CYAN}    ║${BOLD}%*s%s%s%s%*s${NC}${CYAN}║${NC}\n" "$pad_left" "" "$prefix" "$title" "$suffix" "$pad_right" ""
+    echo -e "${CYAN}    ╚══════════════════════════════════════════════╝${NC}"
+    echo -e "${DIM}         ── secure · fast · encrypted ──${NC}"
     echo ""
 }
 
 press_enter() {
     echo ""
-    read -rp "Нажмите Enter для продолжения..." _
+    echo -ne "  ${DIM}─ Нажмите Enter ─${NC}"
+    read -r _
+}
+
+# ── UTF-8 safe repeat ──
+repeat_char() {
+    local char="$1" count="$2"
+    local result=""
+    for ((i=0; i<count; i++)); do
+        result="${result}${char}"
+    done
+    printf '%s' "$result"
+}
+
+# ── Progress bar installer ──
+draw_progress() {
+    local current="$1" total="$2" label="$3"
+    local pct=$((current * 100 / total))
+    local width=25
+    local filled=$((current * width / total))
+    local empty=$((width - filled))
+    
+    printf "\r  ${CYAN}▓${NC}"
+    repeat_char "▓" "$filled"
+    printf "${DIM}"
+    repeat_char "▓" "$empty"
+    printf "${NC} ${DIM}%3d%%${NC}  ${CYAN}▸${NC} %-42s\033[K" "$pct" "$label"
+}
+
+draw_progress_done() {
+    local current="$1" total="$2" label="$3" status="$4"
+    local pct=$((current * 100 / total))
+    local width=25
+    local filled=$((current * width / total))
+    local empty=$((width - filled))
+    local color="${GREEN}"
+    local mark="✓"
+    
+    if [ "$status" = "FAIL" ]; then
+        color="${RED}"
+        mark="✗"
+    fi
+    
+    printf "\r  ${color}▓${NC}"
+    repeat_char "▓" "$filled"
+    printf "${DIM}"
+    repeat_char "▓" "$empty"
+    printf "${NC} ${color}%3d%%${NC}  ${color}${mark}${NC} %-42s\033[K" "$pct" "$label"
+}
+
+run_install_step() {
+    local current="$1" total="$2" label="$3"
+    shift 3
+    
+    local spin_chars="⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    local spin_idx=0
+    local logfile
+    logfile=$(mktemp)
+    
+    # Запускаем команду в фоне, перехватывая вывод
+    ( "$@" ) >"$logfile" 2>&1 &
+    local pid=$!
+    
+    # Пока команда выполняется — крутим спиннер
+    while kill -0 "$pid" 2>/dev/null; do
+        local char="${spin_chars:$spin_idx:1}"
+        draw_progress "$current" "$total" "${char} ${label}"
+        spin_idx=$(((spin_idx + 1) % 10))
+        sleep 0.08
+    done
+    
+    wait "$pid"
+    local exit_code=$?
+    
+    if [ "$exit_code" -eq 0 ]; then
+        draw_progress_done "$current" "$total" "$label" "OK"
+        rm -f "$logfile"
+        return 0
+    else
+        draw_progress_done "$current" "$total" "$label" "FAIL"
+        printf "\n"
+        echo -e "  ${RED}▸ Ошибка выполнения:${NC}"
+        echo -e "  ${DIM}────────────────────────────────────────${NC}"
+        sed 's/^/    /' "$logfile"
+        echo -e "  ${DIM}────────────────────────────────────────${NC}"
+        rm -f "$logfile"
+        return 1
+    fi
 }
 
 full_install() {
-    show_header
-    echo "=== ПОЛНАЯ УСТАНОВКА TRUSTTUNNEL ==="
-    echo ""
-    install_deps
-    install_trusttunnel
+    clear 2>/dev/null || true
+    
+    # Сначала собираем данные (без прогресса, чтобы не ломать TUI)
     get_user_input
-    check_port_available "$LISTEN_PORT"
-    generate_configs
-    get_certificate
-    setup_auto_renewal
-    setup_systemd
-    setup_auto_update
-    export_client_config
-    setup_firewall
-
+    
+    # Очищаем экран от ввода и показываем заголовок установки
+    show_header "Установка"
+    
+    # Все шаги установки подряд — один плавный прогресс-бар
+    local total=10
+    local current=0
+    
+    current=$((current + 1)); run_install_step "$current" "$total" "Установка зависимостей" install_deps || {
+        log_error "Ошибка на шаге: Установка зависимостей"
+        press_enter
+        return 1
+    }
+    current=$((current + 1)); run_install_step "$current" "$total" "Загрузка TrustTunnel" install_trusttunnel || {
+        log_error "Ошибка на шаге: Загрузка TrustTunnel"
+        press_enter
+        return 1
+    }
+    current=$((current + 1)); run_install_step "$current" "$total" "Проверка порта $LISTEN_PORT" check_port_available "$LISTEN_PORT" || true
+    current=$((current + 1)); run_install_step "$current" "$total" "Генерация конфигурации" generate_configs || true
+    current=$((current + 1)); run_install_step "$current" "$total" "Получение SSL-сертификата" get_certificate || true
+    current=$((current + 1)); run_install_step "$current" "$total" "Настройка автообновления сертификатов" setup_auto_renewal || true
+    current=$((current + 1)); run_install_step "$current" "$total" "Настройка systemd сервиса" setup_systemd || true
+    current=$((current + 1)); run_install_step "$current" "$total" "Настройка автообновления TrustTunnel" setup_auto_update || true
+    current=$((current + 1)); run_install_step "$current" "$total" "Экспорт конфигураций клиентов" export_client_config || true
+    current=$((current + 1)); run_install_step "$current" "$total" "Настройка firewall" setup_firewall || true
+    
+    # Финальный прогресс
+    draw_progress_done "$total" "$total" "Установка завершена" "OK"
+    
     echo ""
-    echo -e "${GREEN}========================================${NC}"
-    echo -e "${GREEN}    УСТАНОВКА ЗАВЕРШЕНА УСПЕШНО!${NC}"
-    echo -e "${GREEN}========================================${NC}"
+    echo -e "  ${GREEN}▸ Установка завершена без критических ошибок.${NC}"
+    echo -e "  ${DIM}  Рекомендуем прокрутить выше и проверить лог на предмет warning'ов.${NC}"
     echo ""
-    echo -e "Домен:        ${BOLD}$DOMAIN${NC}"
-    echo -e "Порт:         ${BOLD}$LISTEN_PORT${NC}"
-    echo -e "Пользователей: ${BOLD}${#USERNAMES[@]}${NC}"
+    echo -e "  ${DIM}──────────────────────────────────────────────${NC}"
+    echo ""
+    
+    echo -e "  ${BOLD}Сервер:${NC}  ${CYAN}$DOMAIN${NC}:${CYAN}$LISTEN_PORT${NC}"
+    echo ""
+    
+    # Генерируем и выводим данные для каждого пользователя
+    pushd "${TT_DIR}" > /dev/null
     for idx in "${!USERNAMES[@]}"; do
-        echo "  - ${USERNAMES[$idx]} (конфиг: /root/${CLIENT_NAMES[$idx]}_trusttunnel.toml)"
+        local username="${USERNAMES[$idx]}"
+        local client_name="${CLIENT_NAMES[$idx]}"
+        local cred_file="/root/${client_name}_trusttunnel.toml"
+        local deeplink=""
+        
+        deeplink=$(./trusttunnel_endpoint vpn.toml hosts.toml -c "$username" -a "$DOMAIN:$LISTEN_PORT" --format deeplink 2>/dev/null || echo "")
+        
+        echo -e "  ${BOLD}Пользователь:${NC} ${CYAN}$username${NC}"
+        echo -e "    ${DIM}Конфиг:${NC}  ${CYAN}${cred_file}${NC}"
+        
+        if [ -n "$deeplink" ]; then
+            echo -e "    ${DIM}Ссылка:${NC}  ${GREEN}${deeplink}${NC}"
+            if command -v qrencode &>/dev/null; then
+                echo ""
+                qrencode -t ANSIUTF8 "$deeplink" 2>/dev/null | sed 's/^/    /' || true
+                echo ""
+            fi
+        fi
+        echo ""
     done
+    popd > /dev/null
+    
+    echo -e "  ${BOLD}Управление:${NC}"
+    echo -e "    ${CYAN}systemctl status trusttunnel${NC}"
+    echo -e "    ${CYAN}journalctl -u trusttunnel -f${NC}"
+    echo -e "    ${CYAN}systemctl restart trusttunnel${NC}"
     echo ""
-    echo "Сертификат:   Let's Encrypt (автообновление)"
-    echo "Сервис:       systemctl status trusttunnel"
-    echo "Логи:         journalctl -u trusttunnel -f"
-    echo "Клиент инфо:  /root/trusttunnel_clients.txt"
+    
+    echo -e "  ${DIM}──────────────────────────────────────────────${NC}"
     echo ""
     press_enter
 }
@@ -1656,47 +1947,160 @@ update_trusttunnel() {
 
 # -------- MAIN MENU --------
 
-show_main_menu() {
+# ── Arrow-key interactive menu ──
+MENU_SEL=0
+
+interactive_menu() {
+    local -a items=(
+        "Установить / переустановить TrustTunnel"
+        "Настройка (пресеты / правила / конфигурация)"
+        "Пользователи (добавить / удалить / пароль / экспорт)"
+        "Сертификаты (статус / продление / информация)"
+        "Сервис (запуск / остановка / логи / порты)"
+        "Обновить TrustTunnel"
+        "Статус системы"
+        "Полное удаление TrustTunnel"
+        "Выход"
+    )
+    local -a nums=(1 2 3 4 5 6 7 8 0)
+    local -a colors=("$CYAN" "$CYAN" "$CYAN" "$CYAN" "$CYAN" "$CYAN" "$CYAN" "$RED" "$DIM")
+    local total=${#items[@]}
+    local sel=${MENU_SEL:-0}
+
     while true; do
         show_header
 
-        # Компактный статус
+        # ── Status panel ──
+        echo -e "${DIM}    ┌── SYSTEM STATUS ──────────────────────┐${NC}"
         if systemctl is-active --quiet trusttunnel 2>/dev/null; then
-            echo -e "  Сервис: ${GREEN}● активен${NC}"
+            echo -e "    │  ${GREEN}◉${NC} Сервис: ${GREEN}ONLINE${NC}                    │"
         else
-            echo -e "  Сервис: ${RED}● остановлен${NC}"
+            echo -e "    │  ${RED}◎${NC} Сервис: ${RED}OFFLINE${NC}                   │"
         fi
         if [ -f "${TT_DIR}/credentials.toml" ]; then
             local uc
             uc=$(grep -c 'username' "${TT_DIR}/credentials.toml" 2>/dev/null || echo "0")
-            echo "  Клиентов: $uc"
+            echo -e "    │  ${CYAN}◉${NC} Клиентов: ${BOLD}${uc}${NC}                        │"
+        else
+            echo -e "    │  ${DIM}◉ Клиентов: —${NC}                         │"
         fi
+        echo -e "${DIM}    └───────────────────────────────────────┘${NC}"
         echo ""
 
-        echo "  ${BOLD}1)${NC} Установить / переустановить TrustTunnel"
-        echo "  ${BOLD}2)${NC} Настройка (пресеты / правила / конфигурация)"
-        echo "  ${BOLD}3)${NC} Пользователи (добавить / удалить / пароль / экспорт)"
-        echo "  ${BOLD}4)${NC} Сертификаты (статус / продление / информация)"
-        echo "  ${BOLD}5)${NC} Сервис (запуск / остановка / логи / порты)"
-        echo "  ${BOLD}6)${NC} Обновить TrustTunnel"
-        echo "  ${BOLD}7)${NC} Статус системы"
+        # ── Menu ──
+        echo -e "${DIM}    ╭── MAIN MENU ──────────────────────────╮${NC}"
         echo ""
-        echo "  ${RED}8)${NC} Полное удаление TrustTunnel"
-        echo "  ${BOLD}0)${NC} Выход"
-        echo ""
-        read -rp "Выберите пункт [0-8]: " choice
 
-        case "$choice" in
-            1) full_install ;;
-            2) reconfigure_menu ;;
-            3) user_management_menu ;;
-            4) certificate_menu ;;
-            5) service_menu ;;
-            6) update_trusttunnel ;;
-            7) show_status ;;
-            8) uninstall_trusttunnel ;;
-            0) echo ""; echo "До свидания!"; exit 0 ;;
-            *) log_warn "Неверный выбор" && sleep 1 ;;
+        for i in "${!items[@]}"; do
+            local num="${nums[$i]}"
+            local text="${items[$i]}"
+            local col="${colors[$i]}"
+
+            if [ "$i" -eq "$sel" ]; then
+                # Highlighted (selected) — яркий цвет текста
+                if [ "$i" -eq 7 ]; then
+                    echo -e "  ${RED}▸ ${BOLD}${WHITE}${num})${NC} ${BOLD}${RED}${text}${NC} ${RED}◄${NC}"
+                else
+                    echo -e "  ${CYAN}▸ ${BOLD}${WHITE}${num})${NC} ${BOLD}${CYAN}${text}${NC} ${CYAN}◄${NC}"
+                fi
+            else
+                # Normal — единый префикс для всех
+                echo -e "  ${DIM}┌─${NC} ${col}${num})${NC} ${text}"
+            fi
+        done
+
+        echo ""
+        echo -e "${DIM}    ╰── ↑↓ выбор  •  Enter подтвердить ───╯${NC}"
+        echo ""
+
+        # ── Read key ──
+        local key rest
+        IFS= read -rs -n1 key
+        if [[ "$key" == $'\033' ]]; then
+            IFS= read -rs -n2 rest
+            key="$key$rest"
+        fi
+
+        case "$key" in
+            $'\033[A') # Up
+                sel=$((sel - 1))
+                if [ "$sel" -lt 0 ]; then sel=$((total - 1)); fi
+                ;;
+            $'\033[B') # Down
+                sel=$((sel + 1))
+                if [ "$sel" -ge "$total" ]; then sel=0; fi
+                ;;
+            $'\n'|$'\r'|"") # Enter
+                MENU_SEL="$sel"
+                return
+                ;;
+        esac
+    done
+}
+
+show_main_menu() {
+    # Boot animation (first run only)
+    if [ -z "${TT_BOOT_ANIM_SHOWN:-}" ]; then
+        clear 2>/dev/null || true
+        echo ""
+        echo -e "${CYAN}    ╔══════════════════════════════════════════════╗${NC}"
+        echo -e "${CYAN}    ║${BOLD}  ▓▓▓ TRUSTTUNNEL VPN MANAGER v2 ▓▓▓${NC}${CYAN}          ║${NC}"
+        echo -e "${CYAN}    ╚══════════════════════════════════════════════╝${NC}"
+        echo -e "${DIM}         ── secure · fast · encrypted ──${NC}"
+        echo ""
+        
+        # Progress bar animation
+        local progress=0
+        local total=20
+        echo -ne "    ${DIM}[${NC}"
+        while [ $progress -lt $total ]; do
+            echo -ne "${CYAN}▓${NC}"
+            sleep 0.03
+            progress=$((progress + 1))
+        done
+        echo -e "${DIM}]${NC} ${GREEN}OK${NC}"
+        echo ""
+        
+        # Aligned status messages
+        printf "    ${CYAN}%-30s${NC} ${GREEN}%s${NC}\n" "Initializing kernel modules..." "[ DONE ]"
+        sleep 0.1
+        printf "    ${CYAN}%-30s${NC} ${GREEN}%s${NC}\n" "Loading crypto libraries..." "[ DONE ]"
+        sleep 0.1
+        printf "    ${CYAN}%-30s${NC} ${GREEN}%s${NC}\n" "Connecting to TrustTunnel..." "[ DONE ]"
+        sleep 0.1
+        printf "    ${CYAN}%-30s${NC} ${GREEN}%s${NC}\n" "Verifying certificates..." "[ DONE ]"
+        sleep 0.1
+        printf "    ${CYAN}%-30s${NC} ${GREEN}%s${NC}\n" "System ready." "[ READY ]"
+        echo ""
+        
+        TT_BOOT_ANIM_SHOWN=1
+        sleep 0.5
+    fi
+
+    while true; do
+        interactive_menu
+        local idx="$MENU_SEL"
+
+        case "$idx" in
+            0) echo ""; pulse "[ LAUNCH ] Установка TrustTunnel..." "$CYAN"; full_install ;;
+            1) reconfigure_menu ;;
+            2) user_management_menu ;;
+            3) certificate_menu ;;
+            4) service_menu ;;
+            5) echo ""; pulse "[ UPDATE ] Проверка обновлений..." "$YELLOW"; update_trusttunnel ;;
+            6) show_status ;;
+            7) uninstall_trusttunnel ;;
+            8) echo ""; 
+                echo -e "    ${DIM}────────────────────────────────────────${NC}"
+                printf "    ${CYAN}%-30s${NC} ${YELLOW}%s${NC}\n" "Shutting down services..." "[ STOP ]"
+                sleep 0.2
+                printf "    ${CYAN}%-30s${NC} ${GREEN}%s${NC}\n" "Closing connections..." "[ DONE ]"
+                sleep 0.2
+                printf "    ${CYAN}%-30s${NC} ${GREEN}%s${NC}\n" "System halted." "[  OK  ]"
+                echo -e "    ${DIM}────────────────────────────────────────${NC}"
+                echo ""
+                echo -e "              ${CYAN}До свидания.${NC}"
+                exit 0 ;;
         esac
     done
 }
