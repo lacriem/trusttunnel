@@ -321,13 +321,9 @@ EOF
     fi
 
     cat > rules.toml << 'EOF'
-# ВНИМАНИЕ: правила фильтрации оцениваются по порядку.
-# Если ни одно правило не совпало — соединение РАЗРЕШАЕТСЯ (default-allow).
-# Настоятельно рекомендуется добавить разрешающие правила для ваших клиентов
-# и завершить файл catch-all deny:
-#
-#   [[rule]]
-#   action = "deny"
+# Правила фильтрации оцениваются по порядку. Применяется первое совпавшее правило.
+# client_random_prefix и catch-all deny будут сгенерированы автоматически
+# при создании пользователей через --generate-client-random-prefix.
 #
 # Документация: https://github.com/TrustTunnel/TrustTunnel/blob/master/CONFIGURATION.md#rules-reference
 EOF
@@ -348,13 +344,13 @@ speedtest_enable = false
 [listen_protocols]
 
 [listen_protocols.http1]
-upload_buffer_size = 65536
+upload_buffer_size = 32768
 
 [listen_protocols.http2]
 initial_connection_window_size = 8388608
 initial_stream_window_size = 131072
 max_concurrent_streams = 1000
-max_frame_size = 65536
+max_frame_size = 16384
 header_table_size = 65536
 
 [listen_protocols.quic]
@@ -394,10 +390,24 @@ EOF
 # ===========================
 check_port_available() {
     local port="$1"
-    if ss -tlnp 2>/dev/null | grep -q ":${port} " || ss -ulnp 2>/dev/null | grep -q ":${port} "; then
-        log_error "Порт ${port} уже занят. Освободите его или выберите другой."
+    local occupied=0
+    if ss -tlnp 2>/dev/null | grep -q ":${port} "; then
+        occupied=1
+        log_error "TCP порт ${port} уже занят"
         ss -tlnp 2>/dev/null | grep ":${port} " || true
+    fi
+    if ss -ulnp 2>/dev/null | grep -q ":${port} "; then
+        occupied=1
+        log_error "UDP порт ${port} уже занят"
         ss -ulnp 2>/dev/null | grep ":${port} " || true
+    fi
+    if command -v lsof &>/dev/null && lsof -i UDP:"${port}" 2>/dev/null | grep -q ":${port} "; then
+        occupied=1
+        log_error "UDP порт ${port} занят (по данным lsof)"
+        lsof -i UDP:"${port}" 2>/dev/null || true
+    fi
+    if [ "$occupied" -eq 1 ]; then
+        log_error "Порт ${port} уже занят. Освободите его или выберите другой."
         exit 1
     fi
 }
@@ -570,6 +580,8 @@ setup_systemd() {
 [Unit]
 Description=TrustTunnel VPN Endpoint
 After=network.target
+ConditionPathExists=/opt/trusttunnel/vpn.toml
+ConditionPathExists=/opt/trusttunnel/hosts.toml
 
 [Service]
 Type=simple
@@ -629,7 +641,7 @@ export_client_config() {
         local client_name="${CLIENT_NAMES[$idx]}"
         local cred_file="/root/${client_name}_trusttunnel.toml"
 
-        ./trusttunnel_endpoint vpn.toml hosts.toml -c "$username" -a "$DOMAIN:$LISTEN_PORT" --format toml > "$cred_file" 2>/dev/null || {
+        ./trusttunnel_endpoint vpn.toml hosts.toml -c "$username" -a "$DOMAIN:$LISTEN_PORT" --generate-client-random-prefix --format toml > "$cred_file" 2>/dev/null || {
             log_warn "Не удалось сгенерировать TOML конфигурацию через endpoint binary для $username"
             cat > "$cred_file" << EOF
 endpoint = "https://$DOMAIN:$LISTEN_PORT"
@@ -657,6 +669,19 @@ EOF
         fi
         echo "" >> "$CLIENT_INFO_FILE"
     done
+
+    # Добавляем catch-all deny в конец rules.toml
+    if [ -f "${TT_DIR}/rules.toml" ]; then
+        if ! grep -q '^action = "deny"' "${TT_DIR}/rules.toml"; then
+            cat >> "${TT_DIR}/rules.toml" << 'EOF2'
+
+# Catch-all deny: блокировать все остальные соединения
+[[rule]]
+action = "deny"
+EOF2
+            log_info "Добавлено catch-all deny правило в rules.toml"
+        fi
+    fi
 
     echo "========================================" >> "$CLIENT_INFO_FILE"
     chmod 600 "$CLIENT_INFO_FILE"
@@ -1254,7 +1279,7 @@ apply_preset() {
     case "$preset" in
         1)
             log_info "Применяем пресет: mobile"
-            sed -i 's/^tcp_connections_timeout_secs = .*/tcp_connections_timeout_secs = 3600/' "$config"
+            sed -i 's/^tcp_connections_timeout_secs = .*/tcp_connections_timeout_secs = 2400/' "$config"
             sed -i 's/^udp_connections_timeout_secs = .*/udp_connections_timeout_secs = 180/' "$config"
             sed -i 's/^client_listener_timeout_secs = .*/client_listener_timeout_secs = 300/' "$config"
             sed -i 's/^max_concurrent_streams = .*/max_concurrent_streams = 256/' "$config"
@@ -1263,6 +1288,7 @@ apply_preset() {
             ;;
         2)
             log_info "Применяем пресет: performance"
+            log_warn "Пресет performance требует >=16 GB RAM и мониторинга памяти"
             sed -i 's/^max_concurrent_streams = .*/max_concurrent_streams = 2000/' "$config"
             sed -i 's/^initial_connection_window_size = .*/initial_connection_window_size = 16777216/' "$config"
             sed -i 's/^initial_stream_window_size = .*/initial_stream_window_size = 524288/' "$config"
@@ -1289,8 +1315,8 @@ apply_preset() {
             sed -i 's/^max_concurrent_streams = .*/max_concurrent_streams = 1000/' "$config"
             sed -i 's/^initial_connection_window_size = .*/initial_connection_window_size = 8388608/' "$config"
             sed -i 's/^initial_stream_window_size = .*/initial_stream_window_size = 131072/' "$config"
-            sed -i 's/^upload_buffer_size = .*/upload_buffer_size = 65536/' "$config"
-            sed -i 's/^max_frame_size = .*/max_frame_size = 65536/' "$config"
+            sed -i 's/^upload_buffer_size = .*/upload_buffer_size = 32768/' "$config"
+            sed -i 's/^max_frame_size = .*/max_frame_size = 16384/' "$config"
             sed -i 's/^initial_max_data = .*/initial_max_data = 104857600/' "$config"
             sed -i 's/^initial_max_streams_bidi = .*/initial_max_streams_bidi = 4096/' "$config"
             sed -i 's/^initial_max_streams_uni = .*/initial_max_streams_uni = 4096/' "$config"
@@ -1471,7 +1497,7 @@ EOF
         port=$(grep -oP 'listen_address\s*=\s*"[^:]+:\K[0-9]+' "${TT_DIR}/vpn.toml" 2>/dev/null || echo "443")
 
         pushd "${TT_DIR}" > /dev/null
-        ./trusttunnel_endpoint vpn.toml hosts.toml -c "$username" -a "$domain:$port" --format toml > "$cred_file_client" 2>/dev/null || {
+        ./trusttunnel_endpoint vpn.toml hosts.toml -c "$username" -a "$domain:$port" --generate-client-random-prefix --format toml > "$cred_file_client" 2>/dev/null || {
             cat > "$cred_file_client" << EOF2
 endpoint = "https://$domain:$port"
 username = "$username"
@@ -1480,6 +1506,19 @@ EOF2
         }
         chmod 600 "$cred_file_client"
         popd > /dev/null
+
+        # Добавляем catch-all deny, если отсутствует
+        if [ -f "${TT_DIR}/rules.toml" ]; then
+            if ! grep -q '^action = "deny"' "${TT_DIR}/rules.toml"; then
+                cat >> "${TT_DIR}/rules.toml" << 'EOF2'
+
+# Catch-all deny: блокировать все остальные соединения
+[[rule]]
+action = "deny"
+EOF2
+                log_info "Добавлено catch-all deny правило в rules.toml"
+            fi
+        fi
 
         # QR-код
         local deeplink
@@ -1609,7 +1648,7 @@ export_client_for_user() {
 
     local outfile="/root/${username}_trusttunnel.toml"
     pushd "${TT_DIR}" > /dev/null
-    ./trusttunnel_endpoint vpn.toml hosts.toml -c "$username" -a "$domain:$port" --format toml > "$outfile" 2>/dev/null || {
+    ./trusttunnel_endpoint vpn.toml hosts.toml -c "$username" -a "$domain:$port" --generate-client-random-prefix --format toml > "$outfile" 2>/dev/null || {
         local password
         password=$(grep -A1 "username = \"$username\"" "$cred_file" | grep -oP 'password\s*=\s*"\K[^"]+')
         cat > "$outfile" << EOF2
@@ -1620,6 +1659,19 @@ EOF2
     }
     chmod 600 "$outfile"
     popd > /dev/null
+
+    # Добавляем catch-all deny, если отсутствует
+    if [ -f "${TT_DIR}/rules.toml" ]; then
+        if ! grep -q '^action = "deny"' "${TT_DIR}/rules.toml"; then
+            cat >> "${TT_DIR}/rules.toml" << 'EOF2'
+
+# Catch-all deny: блокировать все остальные соединения
+[[rule]]
+action = "deny"
+EOF2
+            log_info "Добавлено catch-all deny правило в rules.toml"
+        fi
+    fi
 
     log_info "Конфигурация сохранена: $outfile"
 

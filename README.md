@@ -82,9 +82,9 @@ bash setup_trusttunnel_v2.sh --help        # Справка
 |---|---|---|
 | `enable_early_data` | `false` | Защита от QUIC 0-RTT replay-атак (RFC 9000) |
 | `tcp_connections_timeout_secs` | `7200` (2ч) | Предотвращает истощение ресурсов (PROTOCOL.md) |
-| `max_frame_size` (HTTP/2) | `65536` | RFC 7540 §6.5.2 рекомендует для производительности |
+| `max_frame_size` (HTTP/2) | `16384` | Соответствует официальным дефолтам TrustTunnel (безопасно и стабильно) |
 | `allow_private_network_connections` | `false` | Изоляция приватных сетей endpoint |
-| `upload_buffer_size` (HTTP/1) | `65536` | Оптимальный размер буфера |
+| `upload_buffer_size` (HTTP/1) | `32768` | Соответствует официальным дефолтам TrustTunnel |
 | `rules.toml` | Предупреждение о default-allow | Напоминание настроить фильтрацию и catch-all deny |
 | **GPG-верификация** | Ключ AdGuard `28645AC9...` | Проверка подписи бинарника (VERIFY_RELEASES.md) |
 | Пароли | `chmod 600`, 16-символьные | Локальная защита + достаточная энтропия |
