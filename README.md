@@ -27,13 +27,14 @@
 ### Однострочная установка (скачать и запустить)
 
 ```bash
-curl -fsSL -O https://raw.githubusercontent.com/lacriem/trusttunnel/master/setup_trusttunnel_v2.sh && sudo bash setup_trusttunnel_v2.sh
+rm -f setup_trusttunnel_v2.sh && curl -fsSL -O https://raw.githubusercontent.com/lacriem/trusttunnel/master/setup_trusttunnel_v2.sh && sudo bash setup_trusttunnel_v2.sh
 ```
 
 Или по шагам:
 
 ```bash
 sudo su
+rm -f setup_trusttunnel_v2.sh
 curl -fsSL -O https://raw.githubusercontent.com/lacriem/trusttunnel/master/setup_trusttunnel_v2.sh
 bash setup_trusttunnel_v2.sh
 ```
