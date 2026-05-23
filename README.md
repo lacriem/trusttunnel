@@ -24,6 +24,14 @@
 
 ## Быстрый старт
 
+### Однострочная установка (скачать и запустить)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/lacriem/trusttunnel/master/setup_trusttunnel_v2.sh | sudo bash
+```
+
+Или по шагам:
+
 ```bash
 sudo su
 bash setup_trusttunnel_v2.sh
