@@ -285,6 +285,52 @@ get_user_input() {
     echo ""
 }
 
+# ---- default vpn.toml writer (shared by generate_configs & apply_preset) ----
+write_default_vpn_toml() {
+    local target="$1"
+    local listen_addr="${2:-0.0.0.0:443}"
+    cat > "$target" << EOF
+listen_address = "$listen_addr"
+credentials_file = "credentials.toml"
+rules_file = "rules.toml"
+ipv6_available = true
+allow_private_network_connections = false
+tls_handshake_timeout_secs = 10
+client_listener_timeout_secs = 600
+connection_establishment_timeout_secs = 30
+tcp_connections_timeout_secs = 7200
+udp_connections_timeout_secs = 300
+speedtest_enable = false
+
+[listen_protocols]
+
+[listen_protocols.http1]
+upload_buffer_size = 32768
+
+[listen_protocols.http2]
+initial_connection_window_size = 8388608
+initial_stream_window_size = 131072
+max_concurrent_streams = 1000
+max_frame_size = 16384
+header_table_size = 65536
+
+[listen_protocols.quic]
+recv_udp_payload_size = 1350
+send_udp_payload_size = 1350
+initial_max_data = 104857600
+initial_max_stream_data_bidi_local = 1048576
+initial_max_stream_data_bidi_remote = 1048576
+initial_max_stream_data_uni = 1048576
+initial_max_streams_bidi = 4096
+initial_max_streams_uni = 4096
+max_connection_window = 25165824
+max_stream_window = 16777216
+disable_active_migration = true
+enable_early_data = false
+message_queue_capacity = 4096
+EOF
+}
+
 # ===========================
 # 4. GENERATE CONFIGS
 # ===========================
@@ -328,46 +374,7 @@ EOF
 # Документация: https://github.com/TrustTunnel/TrustTunnel/blob/master/CONFIGURATION.md#rules-reference
 EOF
 
-    cat > vpn.toml << EOF
-listen_address = "0.0.0.0:$LISTEN_PORT"
-credentials_file = "credentials.toml"
-rules_file = "rules.toml"
-ipv6_available = true
-allow_private_network_connections = false
-tls_handshake_timeout_secs = 10
-client_listener_timeout_secs = 600
-connection_establishment_timeout_secs = 30
-tcp_connections_timeout_secs = 7200
-udp_connections_timeout_secs = 300
-speedtest_enable = false
-
-[listen_protocols]
-
-[listen_protocols.http1]
-upload_buffer_size = 32768
-
-[listen_protocols.http2]
-initial_connection_window_size = 8388608
-initial_stream_window_size = 131072
-max_concurrent_streams = 1000
-max_frame_size = 16384
-header_table_size = 65536
-
-[listen_protocols.quic]
-recv_udp_payload_size = 1350
-send_udp_payload_size = 1350
-initial_max_data = 104857600
-initial_max_stream_data_bidi_local = 1048576
-initial_max_stream_data_bidi_remote = 1048576
-initial_max_stream_data_uni = 1048576
-initial_max_streams_bidi = 4096
-initial_max_streams_uni = 4096
-max_connection_window = 25165824
-max_stream_window = 16777216
-disable_active_migration = true
-enable_early_data = false
-message_queue_capacity = 4096
-EOF
+    write_default_vpn_toml "${TT_DIR}/vpn.toml" "0.0.0.0:$LISTEN_PORT"
 
     cat > hosts.toml << EOF
 ping_hosts = []
@@ -1276,6 +1283,11 @@ apply_preset() {
     local ts=$(date +%Y%m%d%H%M%S)
     cp "$config" "${BACKUP_DIR}/vpn.toml.before_preset.${ts}" 2>/dev/null || true
 
+    # Сохраняем текущий listen_address, остальное сбрасываем к дефолту
+    local current_listen
+    current_listen=$(grep -oP '^listen_address = "\K[^"]+' "$config" 2>/dev/null || echo "0.0.0.0:443")
+    write_default_vpn_toml "$config" "$current_listen"
+
     case "$preset" in
         1)
             log_info "Применяем пресет: mobile"
@@ -1309,21 +1321,7 @@ apply_preset() {
             ;;
         4)
             log_info "Применяем пресет: balanced (значения по умолчанию)"
-            sed -i 's/^tcp_connections_timeout_secs = .*/tcp_connections_timeout_secs = 7200/' "$config"
-            sed -i 's/^udp_connections_timeout_secs = .*/udp_connections_timeout_secs = 300/' "$config"
-            sed -i 's/^client_listener_timeout_secs = .*/client_listener_timeout_secs = 600/' "$config"
-            sed -i 's/^max_concurrent_streams = .*/max_concurrent_streams = 1000/' "$config"
-            sed -i 's/^initial_connection_window_size = .*/initial_connection_window_size = 8388608/' "$config"
-            sed -i 's/^initial_stream_window_size = .*/initial_stream_window_size = 131072/' "$config"
-            sed -i 's/^upload_buffer_size = .*/upload_buffer_size = 32768/' "$config"
-            sed -i 's/^max_frame_size = .*/max_frame_size = 16384/' "$config"
-            sed -i 's/^initial_max_data = .*/initial_max_data = 104857600/' "$config"
-            sed -i 's/^initial_max_streams_bidi = .*/initial_max_streams_bidi = 4096/' "$config"
-            sed -i 's/^initial_max_streams_uni = .*/initial_max_streams_uni = 4096/' "$config"
-            sed -i 's/^message_queue_capacity = .*/message_queue_capacity = 4096/' "$config"
-            sed -i 's/^enable_early_data = .*/enable_early_data = false/' "$config"
-            sed -i 's/^send_udp_payload_size = .*/send_udp_payload_size = 1350/' "$config"
-            sed -i 's/^recv_udp_payload_size = .*/recv_udp_payload_size = 1350/' "$config"
+            # Файл уже записан дефолтным шаблоном выше, ничего менять не нужно
             ;;
         *)
             log_error "Неверный выбор"
